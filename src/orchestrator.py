@@ -216,6 +216,10 @@ def run(
     """
     Solve all puzzles and write submission CSV. Returns total instruction count.
     """
+    # Prevent SciPy / OpenBLAS / MKL from spawning oversubscribed threads per worker
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
     puzzles = load_puzzles(puzzles_path)
     total_start = time.monotonic()
 
@@ -282,9 +286,10 @@ def run(
             print(f"  {pid}: {count} instructions", flush=True)
 
     if cores > 1:
-        # chunksize=1 guarantees immediate per-puzzle streaming logs with zero batch stalls
+        # Force Linux `fork` context for true 1x CoW sharing of Universal `U`; `chunksize=1` streams immediately
         try:
-            with multiprocessing.Pool(processes=cores) as pool:
+            mp_ctx = multiprocessing.get_context("fork") if os.name != "nt" else multiprocessing.get_context()
+            with mp_ctx.Pool(processes=cores) as pool:
                 for pid, prog_lists, count in pool.imap_unordered(_worker, worker_args, chunksize=1):
                     from src.utils import Instruction
                     results[pid] = [Instruction(*row) for row in prog_lists]
@@ -324,6 +329,10 @@ def run(
 
 def _cli():
     import sys
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     is_notebook = (
         "ipykernel" in sys.modules
         or any("ipykernel" in a or "jupyter" in a or a.endswith(".json") for a in sys.argv)

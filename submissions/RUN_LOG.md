@@ -42,3 +42,11 @@
 - **Verified Local Checks (strictly post-final edit):**
   - `pytest tests/ -v`: **`38 passed in 579.63s`** (`0` errors).
   - Isolated standalone `submissions/kaggle_submission_cell.py` (`212.0 KB`, `U=8M` test cap): **`2,301` total instructions** (`scored_0001..0008`: `2,285`, `-82.9%` vs `13,339` baseline), `U` built in `1.4s`, `Verification PASSED with 0 errors!`.
+
+## Run 4.1 (Hotfix Verified): Explicit `fork` CoW, BLAS Thread Caps & `Phase B/C` Stall Guards
+- **Fixes Applied:**
+  - `src/orchestrator.py`: Forced `multiprocessing.get_context("fork")` on Linux/Kaggle for guaranteed 1x CoW `U` sharing, pinned `OMP_NUM_THREADS=OPENBLAS_NUM_THREADS=MKL_NUM_THREADS=1` per worker to stop HiGHS/OpenBLAS thread oversubscription across 4 CPUs, and enabled `sys.stdout.reconfigure(line_buffering=True)`.
+  - `src/solvers/fast_engine.py`: Focused `Phase B` on the `260` lowest-depth `<= d5` multipliers with `since_add > 10M` / `since_c > 15M` progress-stall breaks so `U` initialization finishes rapidly (`8M` local init cut **`9.4s -> 0.9s`**).
+- **Verified Post-Edit Checks:**
+  - `pytest tests/ -v`: **`38 passed in 319.68s`** (nearly 2x faster than `579.63s`).
+  - Isolated `submissions/kaggle_submission_cell.py` (`212.8 KB`, 12 scored puzzles, `U=8M` test cap): **`2,298` instructions in `33.4s`** (`77.8s -> 33.4s`, **2.3x faster**), `U` built in **`0.9s`**, `Verification PASSED with 0 errors!`.

@@ -2611,13 +2611,14 @@ static inline void univ_par_add(UnivWorkerArg *w, uint64_t v, uint32_t pa, uint3
 static void univ_worker_body(UnivWorkerArg *w) {
     BigDict *d = w->d;
     uint32_t d5 = w->d5_end;
+    uint32_t j_lim = d5 < 260U ? d5 : 260U;
     uint32_t pa_end = w->phase_a_end;
     uint64_t since_add = 0ULL;
     for (uint32_t i = w->d6_end; i < pa_end && w->local_n < w->max_idx; i++) {
         uint64_t a = d->vals[i];
         if (a == 0ULL || bl64(a) > 40) continue;
         uint32_t prev_n = w->local_n;
-        for (uint32_t j = 0; j < d5 && w->local_n < w->max_idx; j++) {
+        for (uint32_t j = 0; j < j_lim && w->local_n < w->max_idx; j++) {
             uint64_t b = d->vals[j];
             u128 p = (u128)a * (u128)b;
             if (p <= (u128)d->vl) univ_par_add(w, (uint64_t)p, i, j, OP_MUL, 8);
@@ -2630,8 +2631,8 @@ static void univ_worker_body(UnivWorkerArg *w) {
             }
         }
         if (w->local_n == prev_n) {
-            since_add += d5;
-            if (since_add > 20000000ULL) break;
+            since_add += j_lim;
+            if (since_add > 10000000ULL) break;
         } else {
             since_add = 0ULL;
         }
@@ -2782,13 +2783,15 @@ EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow, int n_threads) {
         d->n = total_valid;
     }
 
-    /* Phase C: if still below cap, run bounded stride of Phase A x d6 to fill high bands cleanly */
+    /* Phase C: bounded strided fill if still <90% of cap, with stall break */
     if (d->n < (cap * 90U) / 100U && pa_end > d6_end) {
-        uint32_t stride_a = (pa_end - d6_end) > 40000U ? ((pa_end - d6_end) / 40000U) : 1U;
-        uint32_t stride_b = (d6_end - d5_end) > 12000U ? ((d6_end - d5_end) / 12000U) : 1U;
+        uint32_t stride_a = (pa_end - d6_end) > 25000U ? ((pa_end - d6_end) / 25000U) : 1U;
+        uint32_t stride_b = (d6_end - d5_end) > 6000U ? ((d6_end - d5_end) / 6000U) : 1U;
+        uint64_t since_c = 0ULL;
         for (uint32_t i = d6_end; i < pa_end && d->n < cap; i += stride_a) {
             uint64_t a = d->vals[i];
             if (a == 0ULL || bl64(a) > 36) continue;
+            uint32_t prev_c = d->n;
             for (uint32_t j = d5_end; j < d6_end && d->n < cap; j += stride_b) {
                 uint64_t b = d->vals[j];
                 if (bl64(b) > 36) continue;
@@ -2801,6 +2804,12 @@ EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow, int n_threads) {
                     uint32_t phi = a > b ? i : j, plo = a > b ? j : i;
                     bd_add(d, hi - lo, phi, plo, OP_SUB, 9, 1);
                 }
+            }
+            if (d->n == prev_c) {
+                since_c += 6000ULL;
+                if (since_c > 15000000ULL) break;
+            } else {
+                since_c = 0ULL;
             }
         }
     }
@@ -5518,6 +5527,10 @@ def run(
     """
     Solve all puzzles and write submission CSV. Returns total instruction count.
     """
+    # Prevent SciPy / OpenBLAS / MKL from spawning oversubscribed threads per worker
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
     puzzles = load_puzzles(puzzles_path)
     total_start = time.monotonic()
 
@@ -5584,9 +5597,10 @@ def run(
             print(f"  {pid}: {count} instructions", flush=True)
 
     if cores > 1:
-        # chunksize=1 guarantees immediate per-puzzle streaming logs with zero batch stalls
+        # Force Linux `fork` context for true 1x CoW sharing of Universal `U`; `chunksize=1` streams immediately
         try:
-            with multiprocessing.Pool(processes=cores) as pool:
+            mp_ctx = multiprocessing.get_context("fork") if os.name != "nt" else multiprocessing.get_context()
+            with mp_ctx.Pool(processes=cores) as pool:
                 for pid, prog_lists, count in pool.imap_unordered(_worker, worker_args, chunksize=1):
 # [bundled]                     from src.utils import Instruction
                     results[pid] = [Instruction(*row) for row in prog_lists]
@@ -5626,6 +5640,10 @@ def run(
 
 def _cli():
     import sys
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     is_notebook = (
         "ipykernel" in sys.modules
         or any("ipykernel" in a or "jupyter" in a or a.endswith(".json") for a in sys.argv)
