@@ -80,6 +80,7 @@ def solve_puzzle(
     *,
     sa_time: float = 0.0,
     n_starts: int = 2,
+    ram_gb: str | float = "auto",
     verbose: bool = False,
 ) -> list[Instruction]:
     """
@@ -115,10 +116,10 @@ def solve_puzzle(
         except Exception:
             pass
 
-    # --- dag_synthesizer (PRIMARY: 5-engine shared DAG + Rip-Reroute + MILP) ---
+    # --- dag_synthesizer (PRIMARY: High-RAM Shared U + 6-engine DAG + Pair-Rip + MILP) ---
     if puzzle.value_limit >= 40:
         try:
-            prog = dag_synthesizer.solve(puzzle)
+            prog = dag_synthesizer.solve(puzzle, ram_gb=ram_gb)
             r = verify_program(puzzle, prog)
             if r.valid:
                 candidates.append(prog)
@@ -187,9 +188,9 @@ def _worker(args: tuple) -> tuple[str, list[list], int]:
     """
     Multiprocessing worker. Returns (puzzle_id, program_as_list_of_lists, count).
     """
-    puzzle, sa_time, n_starts, verbose = args
+    puzzle, sa_time, n_starts, ram_gb, verbose = args
     try:
-        prog = solve_puzzle(puzzle, sa_time=sa_time, n_starts=n_starts, verbose=verbose)
+        prog = solve_puzzle(puzzle, sa_time=sa_time, n_starts=n_starts, ram_gb=ram_gb, verbose=verbose)
         return puzzle.id, [inst.to_list() for inst in prog], len(prog)
     except Exception as e:
         # Emergency: use fallback
@@ -209,6 +210,7 @@ def run(
     cores: int = 1,
     sa_time: float = 0.0,
     n_starts: int = 2,
+    ram_gb: str | float = "auto",
     verbose: bool = True,
 ) -> int:
     """
@@ -217,12 +219,15 @@ def run(
     puzzles = load_puzzles(puzzles_path)
     total_start = time.monotonic()
 
-    # Pre-warm C99 acceleration library in main process before forking workers
+    # Pre-warm C99 acceleration + Shared Universal `{1}`-Dict U BEFORE fork()
     backend_name = "Python fallback"
     try:
-        from src.solvers.fast_engine import get_clib
-        if get_clib() is not None:
-            backend_name = "C99 __int128 + ctypes"
+        from src.solvers.fast_engine import init_universal_dict
+        info = init_universal_dict(ram_gb=ram_gb)
+        if info.get("c99"):
+            u_n = int(info.get("univ_size", 0))
+            mode = info.get("mode", "auto")
+            backend_name = f"C99 __int128 [{mode}, U={u_n:,} nodes]"
     except Exception:
         pass
 
@@ -230,7 +235,7 @@ def run(
         print(f"Loaded {len(puzzles)} puzzles. Solving with {cores} core(s) [{backend_name}]...")
 
     # Build arguments for workers
-    worker_args = [(p, sa_time, n_starts, verbose and cores == 1) for p in puzzles]
+    worker_args = [(p, sa_time, n_starts, ram_gb, verbose and cores == 1) for p in puzzles]
 
     results: dict[str, list[Instruction]] = {}
 
@@ -248,14 +253,14 @@ def run(
                 print(f"Worker pool encountered {e}; executing remaining on main process...")
             for puzzle in puzzles:
                 if puzzle.id not in results:
-                    pid, prog_lists, count = _worker((puzzle, sa_time, n_starts, verbose))
+                    pid, prog_lists, count = _worker((puzzle, sa_time, n_starts, ram_gb, verbose))
                     from src.utils import Instruction
                     results[pid] = [Instruction(*row) for row in prog_lists]
                     if verbose:
                         print(f"  {pid}: {count} instructions")
     else:
         for puzzle in puzzles:
-            pid, prog_lists, count = _worker((puzzle, sa_time, n_starts, verbose))
+            pid, prog_lists, count = _worker((puzzle, sa_time, n_starts, ram_gb, verbose))
             from src.utils import Instruction
             results[pid] = [Instruction(*row) for row in prog_lists]
 
@@ -299,6 +304,7 @@ def _cli():
     parser.add_argument("--cores",    type=int, default=default_cores, help="Number of parallel workers")
     parser.add_argument("--sa-time",  type=float, default=0.0, help="Optional extra SA time budget per puzzle (s)")
     parser.add_argument("--n-starts", type=int, default=2, help="M-i-M random restarts per small puzzle")
+    parser.add_argument("--ram-gb",   default="auto", help="RAM budget profile in GB ('auto' uses full Kaggle 20-24 GB)")
     parser.add_argument("--verify",   action="store_true", default=True, help="Run full re-verification after solving")
 
     if is_notebook:
@@ -316,6 +322,7 @@ def _cli():
     print(f"  Puzzles source : {puzzles_path}")
     print(f"  Submission out : {out_path}")
     print(f"  Workers        : {args.cores}")
+    print(f"  RAM profile    : {args.ram_gb}")
     print(f"  SA time/puzzle : {args.sa_time}s")
     print("=" * 60)
 
@@ -324,6 +331,7 @@ def _cli():
         cores=args.cores,
         sa_time=args.sa_time,
         n_starts=args.n_starts,
+        ram_gb=args.ram_gb,
         verbose=True,
     )
 

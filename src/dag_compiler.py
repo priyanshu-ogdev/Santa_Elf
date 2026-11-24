@@ -15,6 +15,8 @@ covering all `puzzle.targets`, compiles it to valid 48-register `Instruction`s:
        never evicting a value whose remat path depends on an already-overwritten seed.
 """
 from __future__ import annotations
+import random
+import time
 from collections import defaultdict
 from src.utils import Puzzle, Instruction
 
@@ -83,6 +85,8 @@ def _schedule_dfs(
     seeds: set[int],
     defs: dict[int, tuple[str, int, int]],
     height: dict[int, int],
+    *,
+    lighter_first_on_tie: bool = False,
 ) -> list[int]:
     """Sethi-Ullman post-order DFS emission (heavier child evaluated first)."""
     emitted: set[int] = set(seeds)
@@ -99,8 +103,10 @@ def _schedule_dfs(
             if phase == 0:
                 stk.append((v, 1))
                 _, a, b = defs[v]
-                # Push shallower child FIRST so deeper child is popped and evaluated FIRST
-                if height.get(a, 0) >= height.get(b, 0):
+                ha, hb = height.get(a, 0), height.get(b, 0)
+                eval_a_first = (ha > hb) if lighter_first_on_tie else (ha >= hb)
+                # Push second child FIRST so first-to-eval child is popped and evaluated FIRST
+                if eval_a_first:
                     if b not in emitted:
                         stk.append((b, 0))
                     if a not in emitted:
@@ -169,6 +175,55 @@ def _affinity_target_order(
         order.append(nxt)
         unscheduled.remove(nxt)
         covered.update(anc_map[nxt])
+
+    return order
+
+
+def _mincut_target_order(
+    targets: list[int],
+    seeds: set[int],
+    defs: dict[int, tuple[str, int, int]],
+    height: dict[int, int],
+) -> list[int]:
+    """
+    Order targets to minimize peak live register cut: greedily pick the next target
+    maximizing (shared live nodes freed minus new unmaterialized nodes opened).
+    """
+    if len(targets) <= 2:
+        return sorted(targets, key=lambda x: (height.get(x, 0), x))
+
+    anc_map = {t: _target_ancestors(t, seeds, defs) for t in targets}
+    rem_refs: dict[int, int] = defaultdict(int)
+    for t in targets:
+        for u in anc_map[t]:
+            rem_refs[u] += 1
+
+    unscheduled = set(targets)
+    covered: set[int] = set()
+    order: list[int] = []
+
+    first = min(unscheduled, key=lambda t: (len(anc_map[t]), height.get(t, 0), t))
+    order.append(first)
+    unscheduled.remove(first)
+    covered.update(anc_map[first])
+    for u in anc_map[first]:
+        rem_refs[u] -= 1
+
+    while unscheduled:
+        best_t = min(
+            unscheduled,
+            key=lambda t: (
+                len(anc_map[t] - covered) - sum(1 for u in anc_map[t] if rem_refs[u] == 1),
+                len(anc_map[t] - covered),
+                height.get(t, 0),
+                t,
+            ),
+        )
+        order.append(best_t)
+        unscheduled.remove(best_t)
+        covered.update(anc_map[best_t])
+        for u in anc_map[best_t]:
+            rem_refs[u] -= 1
 
     return order
 
@@ -335,11 +390,12 @@ def _allocate_schedule(
 
 
 def compile_dag(
-    puzzle: Puzzle, defs: dict[int, tuple[str, int, int]]
+    puzzle: Puzzle, defs: dict[int, tuple[str, int, int]], *, n_trials: int = 48
 ) -> list[Instruction]:
     """
     Compile an acyclic value DAG `defs` covering all `puzzle.targets` into
-    valid 48-register `Instruction`s, picking the minimum-spill topological schedule.
+    valid 48-register `Instruction`s, minimizing register spills via Min-Cut,
+    Sethi-Ullman / Subtree-Affinity ordering, and local permutation hill-climbing.
     """
     seeds = set(puzzle.seeds)
     targets = sorted(set(puzzle.targets) - seeds)
@@ -352,29 +408,68 @@ def compile_dag(
     height = _compute_heights(needed, seeds, defs)
 
     target_orders = [
-        sorted(targets, key=lambda x: (height.get(x, 0), x)),
+        _mincut_target_order(targets, seeds, defs, height),
         _affinity_target_order(targets, seeds, defs, height),
+        sorted(targets, key=lambda x: (height.get(x, 0), x)),
         sorted(targets, key=lambda x: (x.bit_length(), x)),
         sorted(targets, key=lambda x: (-height.get(x, 0), x)),
     ]
 
     best_prog: list[Instruction] | None = None
+    best_order: list[int] = target_orders[0]
     seen_scheds: set[tuple[int, ...]] = set()
-    for order in target_orders:
-        sched = _schedule_dfs(order, seeds, defs, height)
+    optimal_len = len(needed)
+
+    def try_order(order: list[int], flip_tie: bool = False) -> bool:
+        nonlocal best_prog, best_order
+        sched = _schedule_dfs(order, seeds, defs, height, lighter_first_on_tie=flip_tie)
         key = tuple(sched)
         if key in seen_scheds:
-            continue
+            return False
         seen_scheds.add(key)
         try:
             prog = _allocate_schedule(puzzle, sched, defs)
             if best_prog is None or len(prog) < len(best_prog):
                 best_prog = prog
-                # Zero-spill optimal reached! No need to try further schedules
-                if len(best_prog) == len(needed):
-                    break
+                best_order = list(order)
+                return True
         except RuntimeError:
-            continue
+            pass
+        return False
+
+    for order in target_orders:
+        try_order(order, flip_tie=False)
+        if best_prog is not None and len(best_prog) == optimal_len:
+            break
+        try_order(order, flip_tie=True)
+        if best_prog is not None and len(best_prog) == optimal_len:
+            break
+
+    # Permutation hill-climbing if any register spill remains
+    if best_prog is not None and len(best_prog) > optimal_len and len(targets) > 2 and n_trials > 0:
+        rng = random.Random(42)
+        t_start = time.monotonic()
+        cur_order = list(best_order)
+        for trial in range(n_trials):
+            if (time.monotonic() - t_start) > 0.30:
+                break
+            cand_order = list(cur_order)
+            if trial % 3 == 0:
+                i = rng.randrange(len(cand_order) - 1)
+                cand_order[i], cand_order[i + 1] = cand_order[i + 1], cand_order[i]
+            elif trial % 3 == 1:
+                i, j = rng.sample(range(len(cand_order)), 2)
+                cand_order[i], cand_order[j] = cand_order[j], cand_order[i]
+            else:
+                i = rng.randrange(len(cand_order))
+                j = rng.randrange(len(cand_order))
+                val = cand_order.pop(i)
+                cand_order.insert(j, val)
+
+            if try_order(cand_order, flip_tie=(trial % 2 == 1)):
+                cur_order = list(cand_order)
+                if len(best_prog) == optimal_len:
+                    break
 
     if best_prog is None:
         raise RuntimeError(f"Failed to compile DAG for puzzle {puzzle.id} in {puzzle.registers} regs")

@@ -292,21 +292,26 @@ def _precompute_smooth_bpe(
     targets: list[int], de: DictEngine
 ) -> dict[int, list[list[tuple[str, int, int, int]]]]:
     """
-    Find smooth-neighbor factorizations (`t + k` with |k|<=28 or seed/2^m) and run
-    BPE factor-multiset CSE so targets sharing subsets of prime factors reuse
-    intermediate composite blocks automatically.
+    Find smooth-neighbor factorizations (`t + k` with C99-screened shifts |k|<=256
+    plus seeds) and run BPE factor-multiset CSE so targets sharing prime blocks reuse them.
     """
     vl = de.vl
-    k_cands = list(range(-28, 29))
+    off_lim = int(de.profile.get("smooth_offset_lim", 64))
+    raw_k = [0]
+    for d in range(1, off_lim + 1):
+        if d in de.seeds_set or de.has(d):
+            raw_k.extend([d, -d])
     for s in de.seeds:
-        if s > 28:
-            k_cands.extend([s, -s])
+        if s > off_lim:
+            raw_k.extend([s, -s])
 
     target_best: dict[int, tuple[int, int, Counter[int], list[tuple[str, int, int, int]]]] = {}
     for t in targets:
+        # Use C99 trial-division screener to quickly isolate top 18 smoothest shifts
+        k_short = de.screen_smooth_offsets(t, raw_k, _SMALL_PRIMES, top_m=18)
         cands = []
         seen_k = set()
-        for k in k_cands:
+        for k in k_short:
             if k in seen_k:
                 continue
             seen_k.add(k)
@@ -467,14 +472,28 @@ def _precompute_smooth_bpe(
 # ---------------------------------------------------------------------------
 
 def _discover_latent_roots(targets: list[int], vl: int) -> list[int]:
-    """Discover hidden roots H where pairs satisfy A ≈ d*H, B ≈ n*H (2 <= d <= 12)."""
+    """
+    Discover hidden roots H where pairs satisfy A ≈ d*H, B ≈ n*H (2 <= d <= 32)
+    OR share nontrivial pairwise GCDs `gcd(A +- k1, B +- k2) > 100`.
+    """
     roots: Counter[int] = Counter()
     ts = sorted(targets)
+    n_t = len(ts)
     for i, A in enumerate(ts):
         if A <= 200:
             continue
-        for B in ts[i + 1 : i + 10]:
-            for d in range(2, 13):
+        for B in ts[i + 1 : min(n_t, i + 12)]:
+            g0 = math.gcd(A, B)
+            if 100 < g0 < A:
+                roots[g0] += 4
+            for off_a in (-1, 0, 1):
+                for off_b in (-1, 0, 1):
+                    if off_a == 0 and off_b == 0:
+                        continue
+                    ga = math.gcd(A + off_a, B + off_b)
+                    if 100 < ga < A:
+                        roots[ga] += 2
+            for d in range(2, 33):
                 n = round(B * d / A)
                 if n <= d or math.gcd(n, d) != 1:
                     continue
@@ -483,7 +502,7 @@ def _discover_latent_roots(targets: list[int], vl: int) -> list[int]:
                     continue
                 if abs(A - d * H) + abs(B - n * H) < max(2000, A // 2000):
                     roots[H] += 1
-    return [h for h, _ in roots.most_common(6)]
+    return [h for h, _ in roots.most_common(10)]
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +537,7 @@ def _synthesize_best_marginal(
         nd = _sub_dag_new_nodes(ops_list, active_defs, de)
         if nd is None:
             return
-        if recipe_collector is not None and len(nd) <= 18:
+        if recipe_collector is not None and len(nd) <= 28:
             recipe_collector.append(nd)
         if best_added is None or len(nd) < len(best_added):
             best_added = nd
@@ -711,21 +730,51 @@ def _synthesize_best_marginal(
                             + [(sgn, prod, r, v)]
                         )
 
-    # 7. Two-Pointer Product Residual (C99 or Python)
+    # 7. Bidirectional C99 MITM quotient-remainder probe over D_local + Universal U
+    if depth >= 2 and v > 100:
+        mitm_hits = de.mitm_probe(v, active_sorted, K=16)
+        seen_mh: set[tuple[int, int]] = set()
+        mh_rec = 0
+        for a, q, r, sgn, _ in mitm_hits:
+            if (a, q) in seen_mh:
+                continue
+            seen_mh.add((a, q))
+            prod = a * q
+            if prod <= 0 or prod > vl:
+                continue
+            op_r = "+" if sgn == 1 else "-"
+            sub_m: list[tuple[str, int, int, int]] = [] if prod in active_set else [("*", a, q, prod)]
+            if r == 0:
+                consider_ops(sub_m if sub_m else [("*", a, q, prod)])
+            elif r in active_set or de.has(r):
+                consider_ops(sub_m + [(op_r, prod, r, v)])
+            elif mh_rec < 4:
+                mh_rec += 1
+                r_added = _synthesize_best_marginal(r, active_defs, active_sorted, de, depth=1)
+                if r_added is not None:
+                    consider_ops(
+                        list(sub_m)
+                        + [(op, ax, bx, rx) for rx, (op, ax, bx) in r_added.items()]
+                        + [(op_r, prod, r, v)]
+                    )
+
+    # 8. Two-Pointer Product Residual (C99 or Python)
     if v > 100:
         tp_hits = de.two_pointer(v, K=12)
         seen_tp: set[int] = set()
+        tp_rec = 0
         for d1, d2, prod, gap, sgn in tp_hits:
             if prod in seen_tp:
                 continue
             seen_tp.add(prod)
             op_r = "+" if sgn == 1 else "-"
-            sub = [("*", d1, d2, prod)] if not de.has(prod) else []
+            sub = [("*", d1, d2, prod)] if not (prod in active_set or prod in seeds) else []
             if gap == 0:
                 consider_ops(sub if sub else [("*", d1, d2, prod)])
             elif gap in active_set or de.has(gap):
                 consider_ops(sub + [(op_r, prod, gap, v)])
-            elif depth >= 2:
+            elif depth >= 2 and tp_rec < 4:
+                tp_rec += 1
                 g_added = _synthesize_best_marginal(gap, active_defs, active_sorted, de, depth=1)
                 if g_added is not None:
                     consider_ops(
@@ -746,10 +795,13 @@ def _milp_polish(
     seeds_set: set[int],
     cur_defs: dict[int, tuple[str, int, int]],
     candidate_recipes: dict[int, list[dict[int, tuple[str, int, int]]]],
+    *,
+    max_edges: int = 3500,
+    time_limit: float = 2.0,
 ) -> Optional[dict[int, tuple[str, int, int]]]:
     """
-    Formulate a small MILP over the union of `cur_defs` and top compact
-    target recipes (capped <= 700 candidate edges) via `scipy.optimize.milp` (HiGHS).
+    Formulate a bounded MILP over the union of `cur_defs` and top compact
+    target recipes (up to `max_edges` candidate edges) via `scipy.optimize.milp` (HiGHS).
     Returns an improved acyclic `defs` dict, or None if unavailable / slower / larger.
     """
     try:
@@ -764,12 +816,12 @@ def _milp_polish(
         edge_set.add((op, a, b, res))
 
     for t in targets:
-        recs = sorted(candidate_recipes.get(t, []), key=len)[:4]
+        recs = sorted(candidate_recipes.get(t, []), key=len)[:7]
         for rmap in recs:
             for res, (op, a, b) in rmap.items():
                 edge_set.add((op, a, b, res))
 
-    if len(edge_set) > 750 or len(edge_set) <= len(cur_defs):
+    if len(edge_set) > max_edges or len(edge_set) <= len(cur_defs):
         return None
 
     edges = sorted(edge_set)
@@ -789,7 +841,7 @@ def _milp_polish(
             out_edges[val_to_idx[res]].append(ei)
 
     banned_cycles: list[list[int]] = []
-    for _ in range(4):
+    for _ in range(8):
         n_vars = nv + ne
         c = np.zeros(n_vars, dtype=float)
         c[:nv] = 1.0
@@ -851,7 +903,7 @@ def _milp_polish(
             integrality=np.ones(n_vars),
             bounds=Bounds(lb_v, ub_v),
             constraints=LinearConstraint(A, b_l, b_u),
-            options={"time_limit": 0.25, "mip_rel_gap": 0.01},
+            options={"time_limit": time_limit, "mip_rel_gap": 0.005},
         )
         if res.x is None:
             return None
@@ -924,10 +976,13 @@ def _milp_polish(
 # Public Entry Point
 # ---------------------------------------------------------------------------
 
-def solve(puzzle: Puzzle, *, force_python: bool = False) -> list[Instruction]:
+def solve(
+    puzzle: Puzzle, *, force_python: bool = False, ram_gb: str | float = "auto"
+) -> list[Instruction]:
     """
-    Solve `puzzle` using the 5-engine shared-DAG synthesizer, Rip-and-Reroute,
-    optional bounded HiGHS MILP polish, Sethi-Ullman compiler, and dead-op cleanup.
+    Solve `puzzle` using the 6-engine shared-DAG synthesizer, Rip-and-Reroute +
+    Pair-Rip LNS, bounded HiGHS MILP polish, Min-Cut/Sethi-Ullman compiler,
+    and dead-op cleanup.
     """
     if puzzle.value_limit < 40:
         from src.solvers import tiny_bfs
@@ -941,13 +996,14 @@ def solve(puzzle: Puzzle, *, force_python: bool = False) -> list[Instruction]:
     if not targets:
         return []
 
-    with DictEngine(puzzle, force_python=force_python) as de:
+    with DictEngine(puzzle, force_python=force_python, ram_gb=ram_gb) as de:
         smooth_map = _precompute_smooth_bpe(targets, de)
         latent_roots = _discover_latent_roots(targets, de.vl)
 
         orderings = [
             latent_roots + sorted(targets, key=lambda t: (t.bit_length(), t)),
             latent_roots + sorted(targets, key=lambda t: (0 if t in smooth_map else 1, t.bit_length(), t)),
+            latent_roots + sorted(targets, key=lambda t: (-t.bit_length(), t)),
         ]
 
         best_defs: Optional[dict[int, tuple[str, int, int]]] = None
@@ -970,7 +1026,7 @@ def solve(puzzle: Puzzle, *, force_python: bool = False) -> list[Instruction]:
                     recipe_collector=col,
                 )
                 if col:
-                    cand_recipes[item].extend(col[:4])
+                    cand_recipes[item].extend(col[:5])
                 if added:
                     active_defs.update(added)
                     active_set.update(added.keys())
@@ -984,9 +1040,9 @@ def solve(puzzle: Puzzle, *, force_python: bool = False) -> list[Instruction]:
             from src.solvers import binary_shared
             return binary_shared.solve(puzzle)
 
-        def prune_dag(dmap: dict[int, tuple[str, int, int]]) -> dict[int, tuple[str, int, int]]:
+        def prune_dag(dmap: dict[int, tuple[str, int, int]], req: list[int] = targets) -> dict[int, tuple[str, int, int]]:
             keep: dict[int, tuple[str, int, int]] = {}
-            stk = list(targets)
+            stk = list(req)
             vis = set(seeds_set)
             while stk:
                 u = stk.pop()
@@ -1003,25 +1059,11 @@ def solve(puzzle: Puzzle, *, force_python: bool = False) -> list[Instruction]:
 
         cur_defs = prune_dag(best_defs)
 
-        # Monotone Rip-and-Reroute sweeps
-        for _ in range(2):
+        # Single-target Monotone Rip-and-Reroute sweeps
+        for _ in range(3):
             improved = False
             for t in reversed(targets):
-                keep_other: dict[int, tuple[str, int, int]] = {}
-                stk = [x for x in targets if x != t]
-                vis = set(seeds_set)
-                while stk:
-                    u = stk.pop()
-                    if u in vis:
-                        continue
-                    vis.add(u)
-                    op, a, b = cur_defs[u]
-                    keep_other[u] = (op, a, b)
-                    if a not in vis:
-                        stk.append(a)
-                    if b not in vis:
-                        stk.append(b)
-
+                keep_other = prune_dag(cur_defs, [x for x in targets if x != t])
                 if t in keep_other or t in seeds_set:
                     if len(keep_other) < len(cur_defs):
                         cur_defs = keep_other
@@ -1040,7 +1082,7 @@ def solve(puzzle: Puzzle, *, force_python: bool = False) -> list[Instruction]:
                     recipe_collector=col_r,
                 )
                 if col_r:
-                    cand_recipes[t].extend(col_r[:3])
+                    cand_recipes[t].extend(col_r[:4])
                 if new_add is not None:
                     cand_defs = dict(keep_other)
                     cand_defs.update(new_add)
@@ -1051,14 +1093,52 @@ def solve(puzzle: Puzzle, *, force_python: bool = False) -> list[Instruction]:
             if not improved:
                 break
 
-        # Compile baseline winner
-        best_prog = remove_dead_ops(puzzle, compile_dag(puzzle, cur_defs))
+        # 2-Target Pair Rip-and-Reroute LNS (escapes locked shared local minima)
+        ts_by_bits = sorted(targets, key=lambda x: (x.bit_length(), x))
+        pair_budget = min(len(ts_by_bits) - 1, 20)
+        for pi in range(pair_budget):
+            ta, tb = ts_by_bits[pi], ts_by_bits[pi + 1]
+            keep_other = prune_dag(cur_defs, [x for x in targets if x != ta and x != tb])
+            g_ab = math.gcd(ta, tb)
+            pair_orders = [(ta, tb), (tb, ta)]
+            for ord_pair in pair_orders:
+                c_defs = dict(keep_other)
+                c_set = set(c_defs.keys()) | seeds_set
+                c_sorted = sorted(c_set)
+                seq_items = ([g_ab] + list(ord_pair)) if (100 < g_ab < min(ta, tb) and g_ab not in c_set) else list(ord_pair)
+                ok_pair = True
+                for x in seq_items:
+                    if x in c_set:
+                        continue
+                    add_x = _synthesize_best_marginal(
+                        x, c_defs, c_sorted, de, depth=2, extra_cands=smooth_map.get(x)
+                    )
+                    if add_x is None:
+                        ok_pair = False
+                        break
+                    c_defs.update(add_x)
+                    c_set.update(add_x.keys())
+                    c_sorted = sorted(c_set)
+                if ok_pair and ta in c_set and tb in c_set:
+                    c_pruned = prune_dag(c_defs)
+                    if len(c_pruned) < len(cur_defs):
+                        cur_defs = c_pruned
 
-        # Optional bounded HiGHS MILP polish over union of top compact recipes
-        milp_defs = _milp_polish(targets, seeds_set, cur_defs, cand_recipes)
+        n_trials = int(de.profile.get("compiler_trials", 48))
+        best_prog = remove_dead_ops(puzzle, compile_dag(puzzle, cur_defs, n_trials=n_trials))
+
+        # Bounded HiGHS MILP polish over union of compact recipes
+        milp_defs = _milp_polish(
+            targets,
+            seeds_set,
+            cur_defs,
+            cand_recipes,
+            max_edges=int(de.profile.get("milp_max_edges", 3500)),
+            time_limit=float(de.profile.get("milp_time", 2.0)),
+        )
         if milp_defs is not None:
             try:
-                milp_prog = remove_dead_ops(puzzle, compile_dag(puzzle, milp_defs))
+                milp_prog = remove_dead_ops(puzzle, compile_dag(puzzle, milp_defs, n_trials=n_trials))
                 if len(milp_prog) < len(best_prog) and verify_program(puzzle, milp_prog).valid:
                     best_prog = milp_prog
             except Exception:
