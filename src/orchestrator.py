@@ -222,47 +222,88 @@ def run(
     # Pre-warm C99 acceleration + Shared Universal `{1}`-Dict U BEFORE fork()
     backend_name = "Python fallback"
     try:
-        from src.solvers.fast_engine import init_universal_dict
+        from src.solvers.fast_engine import init_universal_dict, get_ram_telemetry, get_ram_profile
+        prof0 = get_ram_profile(ram_gb)
+        t0_mem = get_ram_telemetry()
+        if verbose:
+            print(
+                f"Host RAM pre-init: Used {t0_mem['used_gb']:.2f} / {t0_mem['total_gb']:.2f} GB "
+                f"(Avail {t0_mem['avail_gb']:.2f} GB) | Target profile={prof0['mode']} "
+                f"(U_cap={int(prof0['univ_cap']):,}, D_local={int(prof0['local_cap']):,}/worker)",
+                flush=True,
+            )
+        t_u = time.monotonic()
         info = init_universal_dict(ram_gb=ram_gb)
+        dt_u = time.monotonic() - t_u
         if info.get("c99"):
             u_n = int(info.get("univ_size", 0))
+            u_gb = float(info.get("univ_gb", 0.0))
             mode = info.get("mode", "auto")
-            backend_name = f"C99 __int128 [{mode}, U={u_n:,} nodes]"
+            t1_mem = get_ram_telemetry()
+            backend_name = f"C99 __int128 [{mode}, U={u_n:,} nodes, {u_gb:.2f} GB CoW]"
+            if verbose:
+                print(
+                    f"Universal U ready in {dt_u:.1f}s: {u_n:,} nodes ({u_gb:.2f} GB shared CoW) | "
+                    f"Host RAM Used {t1_mem['used_gb']:.2f} / {t1_mem['total_gb']:.2f} GB "
+                    f"(Avail {t1_mem['avail_gb']:.2f} GB, Proc RSS {t1_mem['proc_rss_gb']:.2f} GB)",
+                    flush=True,
+                )
     except Exception:
         pass
 
     if verbose:
-        print(f"Loaded {len(puzzles)} puzzles. Solving with {cores} core(s) [{backend_name}]...")
+        print(f"Loaded {len(puzzles)} puzzles. Solving with {cores} core(s) [{backend_name}]...", flush=True)
 
     # Build arguments for workers
     worker_args = [(p, sa_time, n_starts, ram_gb, verbose and cores == 1) for p in puzzles]
 
     results: dict[str, list[Instruction]] = {}
+    running_total = 0
+
+    def _log_progress(pid: str, count: int) -> None:
+        nonlocal running_total
+        running_total += count
+        if not verbose:
+            return
+        done = len(results)
+        if done % 25 == 0 or done == len(puzzles):
+            el = time.monotonic() - total_start
+            try:
+                from src.solvers.fast_engine import get_ram_telemetry
+                tm = get_ram_telemetry()
+                mem_s = f" | RAM Used {tm['used_gb']:.2f}/{tm['total_gb']:.2f} GB (Avail {tm['avail_gb']:.2f} GB)"
+            except Exception:
+                mem_s = ""
+            print(
+                f"  {pid}: {count} instructions  [{done}/{len(puzzles)} | sum={running_total:,} | {el:.1f}s{mem_s}]",
+                flush=True,
+            )
+        else:
+            print(f"  {pid}: {count} instructions", flush=True)
 
     if cores > 1:
-        chunksize = max(1, len(puzzles) // (cores * 4))
+        # chunksize=1 guarantees immediate per-puzzle streaming logs with zero batch stalls
         try:
             with multiprocessing.Pool(processes=cores) as pool:
-                for pid, prog_lists, count in pool.imap_unordered(_worker, worker_args, chunksize=chunksize):
+                for pid, prog_lists, count in pool.imap_unordered(_worker, worker_args, chunksize=1):
                     from src.utils import Instruction
                     results[pid] = [Instruction(*row) for row in prog_lists]
-                    if verbose:
-                        print(f"  {pid}: {count} instructions")
+                    _log_progress(pid, count)
         except Exception as e:
             if verbose:
-                print(f"Worker pool encountered {e}; executing remaining on main process...")
+                print(f"Worker pool encountered {e}; executing remaining on main process...", flush=True)
             for puzzle in puzzles:
                 if puzzle.id not in results:
                     pid, prog_lists, count = _worker((puzzle, sa_time, n_starts, ram_gb, verbose))
                     from src.utils import Instruction
                     results[pid] = [Instruction(*row) for row in prog_lists]
-                    if verbose:
-                        print(f"  {pid}: {count} instructions")
+                    _log_progress(pid, count)
     else:
         for puzzle in puzzles:
             pid, prog_lists, count = _worker((puzzle, sa_time, n_starts, ram_gb, verbose))
             from src.utils import Instruction
             results[pid] = [Instruction(*row) for row in prog_lists]
+            _log_progress(pid, count)
 
     # Write submission
     write_submission(results, out_path)

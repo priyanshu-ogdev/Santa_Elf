@@ -2232,43 +2232,37 @@ def binary_shared_solve(puzzle: Puzzle) -> list[Instruction]:
 # ===========================================================================
 """
 src/solvers/fast_engine.py
-High-RAM 128-bit overflow-safe Universal + Local Dictionary & C99 MITM Engine.
+V6 High-RAM 4-Thread Sharded 128-bit Universal + Local Dictionary & C99 MITM Engine.
 
-Architecture:
-  1. Global Parent-Shared Universal `{1}`-Dictionary (`U`):
-     Initialized once before `multiprocessing.Pool` `fork()`, staying strictly
-     read-only across workers for 1x Copy-on-Write RAM usage on Linux/Kaggle.
-     Uses 16-byte packed nodes (`uint64_t val` + 29b/29b/2b/4b `meta`) + 4-byte
-     open-addressing index table + 2 MiB L3 duplicate bitset (`< 2^24`).
-     Covers 100% of integers < 2^20 plus dense 20..36-bit arithmetic blocks.
-  2. Per-Puzzle Local Dictionary (`D_local`):
-     Seed-specific products, sums, differences, exact quotients, and squaring
-     backbone (`2..2^32`), plus a contiguous sorted scan slice for `O(N)`
-     two-pointer product-residual search (`fe_two_pointer`).
-  3. Exact C99 Meet-in-the-Middle Probes:
-     - `fe_mitm_probe`: tests `T = a * q +- r` over active DAG values (0 marginal
-       cost) and low-cost divisors across `D_local U U` in `O(1)` hash lookup.
-     - `fe_screen_smooth`: screens hundreds of small shifts `T + k` by trial
-       dividing primes <= 2000 in C99 (< 1ms per target).
-  4. Pure-Python fallback backend (`_PyDictBackend`) when `gcc` is absent.
+Key Engineering & Speed Upgrades:
+  1. 4-Thread Lock-Free 64-Shard Universal `{1}`-Dictionary (`U`):
+     Uses 64 hash shards (`(hash64(v) >> 58) & 63`) so all 4 CPU threads populate
+     independent shards + disjoint value slices with zero locks/atomics (~6 M nodes/s).
+     On Kaggle (~29-30 GB RAM), builds up to `500,000,000` packed 16-byte nodes +
+     `2^31` 4-byte hash slots (`~16.59 GB` Read-Only Copy-on-Write across all 4 workers).
+  2. Zero-Stall `two_pointer` L3 Bitset:
+     Retains the `2 MiB` `seen24` (`< 2^24`) bitset so `fe_two_pointer` evaluates
+     gap reachability in ~1ns in L3 cache instead of missing DRAM in a multi-GB HT.
+  3. High-Yield Divisor Slice (`u->scan_vals`):
+     Caches balanced `< 2^20` + `24..34`-bit divisors in `U` for targeted MITM probing.
+  4. Fast Per-Worker `D_local` (`fe_local_create`):
+     Capped Layer 2/3 (`Phase A` base cross) builds 10M seed-derived nodes in ~1-2s.
 """
 import ctypes
-import math
 import os
 import shutil
 import subprocess
 import tempfile
 from typing import Optional
-# [bundled] from src.utils import Puzzle, apply_op
+# [bundled] from src.utils import Puzzle
 
 
 # ---------------------------------------------------------------------------
-# Host / Kaggle RAM Auto-Detection & Sizing Profiles
+# Host / Kaggle RAM & Process Telemetry
 # ---------------------------------------------------------------------------
 
 def detect_host_ram_gb() -> tuple[float, float]:
     """Return (total_ram_gb, avail_ram_gb) cleanly across Linux and Windows."""
-    # Linux (/proc/meminfo - Kaggle runs Ubuntu Linux)
     if os.path.exists("/proc/meminfo"):
         try:
             tot_kb = avail_kb = 0
@@ -2285,7 +2279,6 @@ def detect_host_ram_gb() -> tuple[float, float]:
         except Exception:
             pass
 
-    # Windows (GlobalMemoryStatusEx)
     if os.name == "nt":
         try:
             class _MEMORYSTATUSEX(ctypes.Structure):
@@ -2310,11 +2303,33 @@ def detect_host_ram_gb() -> tuple[float, float]:
     return 8.0, 4.0
 
 
-def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float]:
+def get_ram_telemetry() -> dict[str, float]:
+    """Return current host total/used/avail GB and current process RSS GB."""
+    tot_gb, avail_gb = detect_host_ram_gb()
+    used_gb = max(0.0, tot_gb - avail_gb)
+    rss_gb = 0.0
+    if os.path.exists("/proc/self/status"):
+        try:
+            with open("/proc/self/status", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss_gb = int(line.split()[1]) / (1024 * 1024)
+                        break
+        except Exception:
+            pass
+    return {
+        "total_gb": tot_gb,
+        "used_gb": used_gb,
+        "avail_gb": avail_gb,
+        "proc_rss_gb": rss_gb,
+    }
+
+
+def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str]:
     """
-    Compute balanced C99 Universal `U`, Per-Worker `D_local`, MILP, and Compiler
-    budgets. On Kaggle (~29-30 GB RAM, Linux CoW), defaults to high-RAM (~20-24 GB
-    aggregate across shared U + 4 parallel workers).
+    Compute C99 Universal `U`, Per-Worker `D_local`, MILP, and Compiler budgets.
+    On Kaggle (~29-30 GB RAM, Linux CoW), defaults to `kaggle_high_ram` (~21-24 GB
+    aggregate: ~16.6 GB shared CoW `U` + 4 workers x ~1.2-1.8 GB).
     """
     total_gb, avail_gb = detect_host_ram_gb()
     on_kaggle = os.path.exists("/kaggle")
@@ -2327,26 +2342,42 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float]:
         except ValueError:
             eff_gb = avail_gb
     else:
-        eff_gb = max(avail_gb, 24.0) if (on_kaggle and total_gb >= 24.0) else avail_gb
+        eff_gb = max(avail_gb, 25.0) if (on_kaggle and total_gb >= 24.0) else avail_gb
 
-    if eff_gb >= 18.0:
-        # Kaggle 20-24 GB aggregate budget:
-        #   U (~300M nodes, HT=2^30 -> ~9.09 GB CoW shared across 4 workers)
-        #   + 4 workers x (4M local + 1.5M scan + MILP + Python ~ 2.5-3.5 GB) ~ 12-14 GB
+    if eff_gb >= 22.0:
+        # Kaggle ~20-26 GB aggregate budget:
+        #   U: 500M nodes x 16B (8.00 GB) + HT=2^31 x 4B (8.59 GB) = 16.59 GB Read-Only CoW
+        #   + 4 workers x (10M local ~300 MB + 800k scan + MITM + MILP/Python) ~ 5-8 GB
         return {
             "mode": "kaggle_high_ram",
             "eff_gb": eff_gb,
-            "univ_cap": 300_000_000,
-            "univ_ht_pow": 30,
-            "local_cap": 4_000_000,
-            "local_ht_pow": 24,
-            "local_scan": 1_500_000,
-            "per_bucket": 65_000,
-            "mitm_div_scan": 450_000,
+            "univ_cap": 500_000_000,
+            "univ_ht_pow": 31,
+            "local_cap": 10_000_000,
+            "local_ht_pow": 25,
+            "local_scan": 800_000,
+            "per_bucket": 160_000,
+            "mitm_div_scan": 250_000,
             "smooth_offset_lim": 256,
             "milp_max_edges": 3500,
             "milp_time": 2.0,
             "compiler_trials": 64,
+        }
+    if eff_gb >= 14.0:
+        return {
+            "mode": "high_ram_16g",
+            "eff_gb": eff_gb,
+            "univ_cap": 280_000_000,
+            "univ_ht_pow": 30,
+            "local_cap": 4_000_000,
+            "local_ht_pow": 24,
+            "local_scan": 600_000,
+            "per_bucket": 65_000,
+            "mitm_div_scan": 220_000,
+            "smooth_offset_lim": 200,
+            "milp_max_edges": 3000,
+            "milp_time": 1.5,
+            "compiler_trials": 48,
         }
     if eff_gb >= 6.5:
         return {
@@ -2356,9 +2387,9 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float]:
             "univ_ht_pow": 27,
             "local_cap": 1_500_000,
             "local_ht_pow": 22,
-            "local_scan": 600_000,
+            "local_scan": 450_000,
             "per_bucket": 25_000,
-            "mitm_div_scan": 250_000,
+            "mitm_div_scan": 180_000,
             "smooth_offset_lim": 160,
             "milp_max_edges": 2500,
             "milp_time": 1.0,
@@ -2382,23 +2413,26 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float]:
 
 
 # ---------------------------------------------------------------------------
-# C99 Backend (Packed 16B Nodes + 4B Hash Index + Universal Shared Dict + MITM)
+# C99 Backend (64-Shard Lock-Free Parallel U + L3 Seen24 + High-Yield Divs)
 # ---------------------------------------------------------------------------
 
 _C_SOURCE = r'''
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
 #ifdef _WIN32
+#include <windows.h>
 #define EXPORT __declspec(dllexport)
 #else
+#include <pthread.h>
+#include <unistd.h>
 #define EXPORT
 #endif
 
 typedef unsigned __int128 u128;
 
 #define EMPTY_PA 0x1FFFFFFFULL
+#define N_SHARDS 64
 #define OP_ADD 0
 #define OP_SUB 1
 #define OP_MUL 2
@@ -2426,15 +2460,17 @@ typedef struct {
     uint64_t *vals;
     uint64_t *meta;
     int32_t  *ht;
-    uint64_t *seen24;     /* 2^24 bits = 2 MiB fast L3 duplicate filter */
-    uint32_t  ht_mask;
-    uint32_t  n;
+    uint64_t *seen24;     /* 2^24 bits = 2 MiB fast L3 duplicate/hit bitset */
+    uint32_t  shard_mask;
+    uint32_t  shard_shift;
+    uint32_t  n;          /* total active logical nodes (may include 0-gaps in parallel build) */
     uint32_t  cap;
     uint64_t  vl;
     int32_t   bucket_cnt[65];
     int32_t   bucket_cap[65];
+    uint64_t  alloc_bytes;
 
-    /* Sorted contiguous scan slice for O(N) two-pointer & bisect */
+    /* Contiguous sorted scan / high-yield divisor slice */
     uint64_t *scan_vals;
     uint8_t  *scan_costs;
     uint32_t  n_scan;
@@ -2442,12 +2478,16 @@ typedef struct {
 
 static inline int32_t bd_find(const BigDict *d, uint64_t k) {
     if (!d || k == 0 || k > d->vl) return -1;
-    uint32_t h = (uint32_t)hash64(k) & d->ht_mask;
+    uint64_t hv = hash64(k);
+    uint32_t sh = (uint32_t)(hv >> 58) & (N_SHARDS - 1);
+    uint32_t sb = sh << d->shard_shift;
+    uint32_t sm = d->shard_mask;
+    uint32_t h = (uint32_t)hv & sm;
     for (;;) {
-        int32_t idx = d->ht[h];
+        int32_t idx = d->ht[sb | h];
         if (idx < 0) return -1;
         if (d->vals[idx] == k) return idx;
-        h = (h + 1) & d->ht_mask;
+        h = (h + 1U) & sm;
     }
 }
 
@@ -2455,22 +2495,25 @@ static inline int bd_add(
     BigDict *d, uint64_t v, uint32_t pa, uint32_t pb, uint8_t op, uint8_t cost, int use_cap
 ) {
     if (v == 0 || v > d->vl || d->n >= d->cap) return 0;
-    if (d->seen24 && v < (1ULL << 24)) {
-        if (d->seen24[v >> 6] & (1ULL << (v & 63))) return 0;
-    }
     int bl = bl64(v);
     if (use_cap && d->bucket_cap[bl] > 0 && d->bucket_cnt[bl] >= d->bucket_cap[bl]) return 0;
-    uint32_t h = (uint32_t)hash64(v) & d->ht_mask;
+    if (d->seen24 && v < (1ULL << 24) && (d->seen24[v >> 6] & (1ULL << (v & 63)))) return 0;
+
+    uint64_t hv = hash64(v);
+    uint32_t sh = (uint32_t)(hv >> 58) & (N_SHARDS - 1);
+    uint32_t sb = sh << d->shard_shift;
+    uint32_t sm = d->shard_mask;
+    uint32_t h = (uint32_t)hv & sm;
     for (;;) {
-        int32_t idx = d->ht[h];
+        int32_t idx = d->ht[sb | h];
         if (idx < 0) break;
         if (d->vals[idx] == v) return 0;
-        h = (h + 1) & d->ht_mask;
+        h = (h + 1U) & sm;
     }
     uint32_t idx = d->n++;
     d->vals[idx] = v;
     d->meta[idx] = pack_meta(pa, pb, op, cost);
-    d->ht[h] = (int32_t)idx;
+    d->ht[sb | h] = (int32_t)idx;
     if (d->seen24 && v < (1ULL << 24)) d->seen24[v >> 6] |= (1ULL << (v & 63));
     d->bucket_cnt[bl]++;
     return 1;
@@ -2493,45 +2536,132 @@ static void free_bigdict(BigDict *d) {
     free(d);
 }
 
-/* Safe allocation helper: returns NULL cleanly if memory unavailable. */
 static BigDict* alloc_bigdict(uint32_t cap, uint32_t ht_pow, uint64_t vl) {
-    if (cap > 500000000U) cap = 500000000U;
+    if (cap > 530000000U) cap = 530000000U;
+    if (ht_pow < 12U) ht_pow = 12U;
     BigDict *d = (BigDict *)calloc(1, sizeof(BigDict));
     if (!d) return NULL;
     uint64_t ht_size = 1ULL << ht_pow;
-    d->ht_mask = (uint32_t)(ht_size - 1ULL);
+    d->shard_shift = ht_pow - 6U;
+    d->shard_mask = (1U << d->shard_shift) - 1U;
     d->cap = cap;
     d->vl = vl;
-    d->vals = (uint64_t *)malloc((size_t)cap * sizeof(uint64_t));
-    d->meta = (uint64_t *)malloc((size_t)cap * sizeof(uint64_t));
-    d->ht   = (int32_t *)malloc((size_t)ht_size * sizeof(int32_t));
+
+    /* Use calloc for vals so any unused parallel gaps remain 0 cleanly */
+    size_t sz_v = (size_t)cap * sizeof(uint64_t);
+    size_t sz_m = (size_t)cap * sizeof(uint64_t);
+    size_t sz_h = (size_t)ht_size * sizeof(int32_t);
+    size_t sz_s = (size_t)(1U << 18) * sizeof(uint64_t);
+
+    d->vals = (uint64_t *)calloc(cap, sizeof(uint64_t));
+    d->meta = (uint64_t *)malloc(sz_m);
+    d->ht   = (int32_t *)malloc(sz_h);
     d->seen24 = (uint64_t *)calloc((1U << 18), sizeof(uint64_t));
     if (!d->vals || !d->meta || !d->ht || !d->seen24) {
         free_bigdict(d);
         return NULL;
     }
-    memset(d->ht, 0xFF, (size_t)ht_size * sizeof(int32_t));
+    memset(d->ht, 0xFF, sz_h);
+    d->alloc_bytes = (uint64_t)(sz_v + sz_m + sz_h + sz_s + sizeof(BigDict));
     return d;
 }
 
+/* Parallel worker context for lock-free 64-shard Universal U construction */
+typedef struct {
+    BigDict *d;
+    int tid;
+    int n_threads;
+    uint32_t base_idx;
+    uint32_t max_idx;
+    uint32_t local_n;
+    uint32_t d5_end;
+    uint32_t d6_end;
+    uint32_t phase_a_end;
+    int32_t bcnt[65];
+    int32_t bcap[65];
+} UnivWorkerArg;
+
+static inline void univ_par_add(UnivWorkerArg *w, uint64_t v, uint32_t pa, uint32_t pb, uint8_t op, uint8_t cost) {
+    BigDict *d = w->d;
+    if (v == 0 || v > d->vl || w->local_n >= w->max_idx) return;
+    int bl = bl64(v);
+    if (w->bcap[bl] > 0 && w->bcnt[bl] >= w->bcap[bl]) return;
+    if (v < (1ULL << 24) && (d->seen24[v >> 6] & (1ULL << (v & 63)))) return;
+
+    uint64_t hv = hash64(v);
+    uint32_t sh = (uint32_t)(hv >> 58) & (N_SHARDS - 1);
+    if ((int)(sh % (uint32_t)w->n_threads) != w->tid) return;
+
+    uint32_t sb = sh << d->shard_shift;
+    uint32_t sm = d->shard_mask;
+    uint32_t h = (uint32_t)hv & sm;
+    for (;;) {
+        int32_t idx = d->ht[sb | h];
+        if (idx < 0) break;
+        if (d->vals[idx] == v) return;
+        h = (h + 1U) & sm;
+    }
+    uint32_t idx = w->base_idx + w->local_n++;
+    d->vals[idx] = v;
+    d->meta[idx] = pack_meta(pa, pb, op, cost);
+    d->ht[sb | h] = (int32_t)idx;
+    w->bcnt[bl]++;
+}
+
+static void univ_worker_body(UnivWorkerArg *w) {
+    BigDict *d = w->d;
+    uint32_t d5 = w->d5_end;
+    uint32_t pa_end = w->phase_a_end;
+    uint64_t since_add = 0ULL;
+    for (uint32_t i = w->d6_end; i < pa_end && w->local_n < w->max_idx; i++) {
+        uint64_t a = d->vals[i];
+        if (a == 0ULL || bl64(a) > 40) continue;
+        uint32_t prev_n = w->local_n;
+        for (uint32_t j = 0; j < d5 && w->local_n < w->max_idx; j++) {
+            uint64_t b = d->vals[j];
+            u128 p = (u128)a * (u128)b;
+            if (p <= (u128)d->vl) univ_par_add(w, (uint64_t)p, i, j, OP_MUL, 8);
+            u128 s = (u128)a + (u128)b;
+            if (s <= (u128)d->vl) univ_par_add(w, (uint64_t)s, i, j, OP_ADD, 8);
+            if (a != b) {
+                uint64_t hi = a > b ? a : b, lo = a > b ? b : a;
+                uint32_t phi = a > b ? i : j, plo = a > b ? j : i;
+                univ_par_add(w, hi - lo, phi, plo, OP_SUB, 8);
+            }
+        }
+        if (w->local_n == prev_n) {
+            since_add += d5;
+            if (since_add > 20000000ULL) break;
+        } else {
+            since_add = 0ULL;
+        }
+    }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI win_univ_worker(LPVOID arg) { univ_worker_body((UnivWorkerArg *)arg); return 0; }
+#else
+static void* posix_univ_worker(void *arg) { univ_worker_body((UnivWorkerArg *)arg); return NULL; }
+#endif
+
 /*
- * Global Parent-Shared Read-Only Universal `{1}` Dictionary.
- * Prioritizes full coverage < 2^20 and dense 20..36-bit arithmetic blocks.
+ * Global Parent-Shared Read-Only Universal `{1}` Dictionary built across `n_threads`
+ * lock-free sharded OS threads (~6 M nodes/sec!).
  */
-EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow) {
+EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow, int n_threads) {
+    if (n_threads < 1) n_threads = 1;
+    if (n_threads > 8) n_threads = 8;
     BigDict *d = alloc_bigdict(cap, ht_pow, (1ULL << 61));
     if (!d) return NULL;
 
     for (int bl = 1; bl <= 64; bl++) {
         if (bl <= 24)      d->bucket_cap[bl] = (int32_t)(cap / 12U);
-        else if (bl <= 35) d->bucket_cap[bl] = (int32_t)(cap / 13U);
-        else if (bl <= 44) d->bucket_cap[bl] = (int32_t)(cap / 30U);
-        else               d->bucket_cap[bl] = (int32_t)(cap / 80U);
+        else if (bl <= 38) d->bucket_cap[bl] = (int32_t)(cap / 14U);
+        else if (bl <= 46) d->bucket_cap[bl] = (int32_t)(cap / 28U);
+        else               d->bucket_cap[bl] = (int32_t)(cap / 75U);
     }
 
     bd_add(d, 1ULL, EMPTY_PA, EMPTY_PA, OP_ADD, 0, 0);
-
-    /* Explicit squaring backbone: 2, 4, 16, 256, 65536, 2^32 */
     int32_t i1 = bd_find(d, 1ULL);
     if (i1 >= 0) bd_add(d, 2ULL, (uint32_t)i1, (uint32_t)i1, OP_ADD, 1, 0);
     uint64_t sq = 2ULL;
@@ -2543,7 +2673,7 @@ EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow) {
         bd_add(d, sq, (uint32_t)isq, (uint32_t)isq, OP_MUL, c_next, 0);
     }
 
-    /* Depth 1..6 exhaustive universal DAG BFS */
+    /* Depth 1..6 exhaustive (~75,955 nodes in <25ms) */
     uint32_t ls = 0, le = d->n, d5_end = 0;
     for (int depth = 1; depth <= 6 && d->n < cap; depth++) {
         for (uint32_t i = ls; i < le && d->n < cap; i++) {
@@ -2568,8 +2698,8 @@ EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow) {
         if (depth == 5) d5_end = d->n;
     }
 
+    /* Phase A (d6 x <= d5): ~6.6M low-cost nodes in ~0.9s */
     uint32_t d6_end = d->n;
-    /* Phase A: d6 x <= d5 (dense low-DAG-size expansions, guarantees <2^20 ~100%) */
     for (uint32_t i = d5_end; i < d6_end && d->n < cap; i++) {
         uint64_t a = d->vals[i];
         for (uint32_t j = 0; j < d5_end && d->n < cap; j++) {
@@ -2586,34 +2716,126 @@ EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow) {
         }
     }
 
-    /* Phase B: d6 x d6 filling 24..36-bit dense meet-in-the-middle band */
-    for (uint32_t i = d5_end; i < d6_end && d->n < cap; i++) {
-        uint64_t a = d->vals[i];
-        if (bl64(a) > 36) continue;
-        for (uint32_t j = i; j < d6_end && d->n < cap; j++) {
-            uint64_t b = d->vals[j];
-            if (bl64(b) > 36) continue;
-            u128 p = (u128)a * (u128)b;
-            if (p <= (u128)d->vl) bd_add(d, (uint64_t)p, i, j, OP_MUL, 8, 1);
-            u128 s = (u128)a + (u128)b;
-            if (s <= (u128)d->vl) bd_add(d, (uint64_t)s, i, j, OP_ADD, 8, 1);
-            if (a != b) {
-                uint64_t hi = a > b ? a : b, lo = a > b ? b : a;
-                uint32_t phi = a > b ? i : j, plo = a > b ? j : i;
-                bd_add(d, hi - lo, phi, plo, OP_SUB, 8, 1);
+    /* Phase B (Parallel lock-free sharded expansion across Phase A x <= d5) */
+    uint32_t pa_end = d->n;
+    uint32_t total_valid = pa_end;
+    if (pa_end < cap) {
+        UnivWorkerArg wargs[8];
+        uint32_t chunk = (cap - pa_end) / (uint32_t)n_threads;
+        for (int t = 0; t < n_threads; t++) {
+            wargs[t].d = d;
+            wargs[t].tid = t;
+            wargs[t].n_threads = n_threads;
+            wargs[t].base_idx = pa_end + (uint32_t)t * chunk;
+            wargs[t].max_idx = chunk;
+            wargs[t].local_n = 0;
+            wargs[t].d5_end = d5_end;
+            wargs[t].d6_end = d6_end;
+            wargs[t].phase_a_end = pa_end;
+            memset(wargs[t].bcnt, 0, sizeof(wargs[t].bcnt));
+            for (int bl = 1; bl <= 64; bl++) {
+                int32_t rem_c = d->bucket_cap[bl] - d->bucket_cnt[bl];
+                wargs[t].bcap[bl] = (rem_c > 0) ? (rem_c / n_threads + 1) : 1;
+            }
+        }
+#ifdef _WIN32
+        HANDLE th[8];
+        for (int t = 0; t < n_threads; t++) th[t] = CreateThread(NULL, 0, win_univ_worker, &wargs[t], 0, NULL);
+        WaitForMultipleObjects((DWORD)n_threads, th, TRUE, INFINITE);
+        for (int t = 0; t < n_threads; t++) CloseHandle(th[t]);
+#else
+        pthread_t th[8];
+        for (int t = 0; t < n_threads; t++) pthread_create(&th[t], NULL, posix_univ_worker, &wargs[t]);
+        for (int t = 0; t < n_threads; t++) pthread_join(th[t], NULL);
+#endif
+        /* Compact Phase B segments contiguously from pa_end so Phase C & lookups have 0 gaps */
+        uint32_t write_pos = pa_end;
+        for (int t = 0; t < n_threads; t++) {
+            uint32_t base = wargs[t].base_idx;
+            uint32_t ln = wargs[t].local_n;
+            for (uint32_t k = 0; k < ln; k++) {
+                uint32_t src_idx = base + k;
+                uint64_t vv = d->vals[src_idx];
+                if (vv < (1ULL << 24)) d->seen24[vv >> 6] |= (1ULL << (vv & 63));
+                if (write_pos != src_idx) {
+                    d->vals[write_pos] = vv;
+                    d->meta[write_pos] = d->meta[src_idx];
+                    d->vals[src_idx] = 0ULL;
+                    /* Update hash table pointer to new compacted index */
+                    uint64_t hv = hash64(vv);
+                    uint32_t sh = (uint32_t)(hv >> 58) & (N_SHARDS - 1);
+                    uint32_t sb = sh << d->shard_shift;
+                    uint32_t sm = d->shard_mask;
+                    uint32_t h = (uint32_t)hv & sm;
+                    while (d->ht[sb | h] >= 0) {
+                        if ((uint32_t)d->ht[sb | h] == src_idx) {
+                            d->ht[sb | h] = (int32_t)write_pos;
+                            break;
+                        }
+                        h = (h + 1U) & sm;
+                    }
+                }
+                write_pos++;
+            }
+            total_valid += ln;
+        }
+        d->n = total_valid;
+    }
+
+    /* Phase C: if still below cap, run bounded stride of Phase A x d6 to fill high bands cleanly */
+    if (d->n < (cap * 90U) / 100U && pa_end > d6_end) {
+        uint32_t stride_a = (pa_end - d6_end) > 40000U ? ((pa_end - d6_end) / 40000U) : 1U;
+        uint32_t stride_b = (d6_end - d5_end) > 12000U ? ((d6_end - d5_end) / 12000U) : 1U;
+        for (uint32_t i = d6_end; i < pa_end && d->n < cap; i += stride_a) {
+            uint64_t a = d->vals[i];
+            if (a == 0ULL || bl64(a) > 36) continue;
+            for (uint32_t j = d5_end; j < d6_end && d->n < cap; j += stride_b) {
+                uint64_t b = d->vals[j];
+                if (bl64(b) > 36) continue;
+                u128 p = (u128)a * (u128)b;
+                if (p <= (u128)d->vl) bd_add(d, (uint64_t)p, i, j, OP_MUL, 9, 1);
+                u128 s = (u128)a + (u128)b;
+                if (s <= (u128)d->vl) bd_add(d, (uint64_t)s, i, j, OP_ADD, 9, 1);
+                if (a != b) {
+                    uint64_t hi = a > b ? a : b, lo = a > b ? b : a;
+                    uint32_t phi = a > b ? i : j, plo = a > b ? j : i;
+                    bd_add(d, hi - lo, phi, plo, OP_SUB, 9, 1);
+                }
             }
         }
     }
 
-    /* Free seen24 before fork to slim Read-Only U footprint (already indexed in ht) */
-    free(d->seen24);
-    d->seen24 = NULL;
+    /* Extract compact high-yield divisor array `scan_vals` (~300k items: 100k <=23b + 200k 24..34b) */
+    uint32_t max_udiv = 300000U;
+    d->scan_vals = (uint64_t *)malloc(sizeof(uint64_t) * max_udiv);
+    d->scan_costs = (uint8_t *)malloc(sizeof(uint8_t) * max_udiv);
+    if (d->scan_vals && d->scan_costs) {
+        uint32_t cnt_lo = 0, cnt_mid = 0, out_u = 0;
+        for (uint32_t k = 1; k < cap && out_u < max_udiv; k++) {
+            uint64_t v = d->vals[k];
+            if (v <= 1ULL) continue;
+            int bl = bl64(v);
+            if (bl <= 23 && cnt_lo < 100000U) {
+                d->scan_vals[out_u] = v;
+                d->scan_costs[out_u] = meta_cost(d->meta[k]);
+                cnt_lo++; out_u++;
+            } else if (bl >= 24 && bl <= 34 && cnt_mid < 200000U) {
+                d->scan_vals[out_u] = v;
+                d->scan_costs[out_u] = meta_cost(d->meta[k]);
+                cnt_mid++; out_u++;
+            }
+            if (cnt_lo >= 100000U && cnt_mid >= 200000U) break;
+        }
+        d->n_scan = out_u;
+        d->alloc_bytes += (uint64_t)(sizeof(uint64_t) + sizeof(uint8_t)) * max_udiv;
+    }
     return d;
 }
 
 EXPORT void fe_dict_free(void *p) { free_bigdict((BigDict *)p); }
 EXPORT uint32_t fe_dict_size(void *p) { return p ? ((BigDict *)p)->n : 0U; }
 EXPORT uint32_t fe_scan_size(void *p) { return p ? ((BigDict *)p)->n_scan : 0U; }
+EXPORT uint64_t fe_dict_bytes(void *p) { return p ? ((BigDict *)p)->alloc_bytes : 0ULL; }
 
 EXPORT int32_t fe_dict_lookup(void *p, uint64_t v) {
     return bd_find((const BigDict *)p, v);
@@ -2623,7 +2845,7 @@ EXPORT void fe_dict_get(
     void *p, uint32_t idx, uint64_t *val, uint64_t *va, uint64_t *vb, int *op, int *cost
 ) {
     const BigDict *d = (const BigDict *)p;
-    if (!d || idx >= d->n) { *op = -1; return; }
+    if (!d || idx >= d->cap || d->vals[idx] == 0ULL) { *op = -1; return; }
     uint64_t m = d->meta[idx];
     uint32_t pa = meta_pa(m), pb = meta_pb(m);
     *val = d->vals[idx];
@@ -2631,7 +2853,7 @@ EXPORT void fe_dict_get(
     if (pa == EMPTY_PA) {
         *op = 0; *va = 0; *vb = 0;
     } else {
-        *op = (int)meta_op(m) + 1; /* 1=+, 2=-, 3=*, 4=/ */
+        *op = (int)meta_op(m) + 1;
         *va = d->vals[pa];
         *vb = d->vals[pb];
     }
@@ -2644,9 +2866,7 @@ EXPORT uint32_t fe_dict_copy_scan(void *p, uint64_t *out) {
 }
 
 /*
- * Per-puzzle Local Seed Dictionary `D_local`.
- * Builds balanced bit-buckets across seeds, squaring powers, small constants 1..256,
- * and cross expansions, plus builds a sorted `scan_cap` contiguous array for 2-ptr.
+ * Fast Per-Puzzle Seed Dictionary `D_local` (builds up to 10M nodes cleanly in ~1-2s).
  */
 EXPORT void* fe_local_create(
     const uint64_t *seeds, int ns, uint64_t vl, uint32_t cap, uint32_t ht_pow,
@@ -2656,9 +2876,7 @@ EXPORT void* fe_local_create(
     if (!d) return NULL;
     for (int bl = 1; bl <= 64; bl++) d->bucket_cap[bl] = (int32_t)per_b;
 
-    for (int i = 0; i < ns; i++) {
-        bd_add(d, seeds[i], EMPTY_PA, EMPTY_PA, OP_ADD, 0, 0);
-    }
+    for (int i = 0; i < ns; i++) bd_add(d, seeds[i], EMPTY_PA, EMPTY_PA, OP_ADD, 0, 0);
     if (bd_find(d, 1ULL) < 0 && ns > 0) {
         int32_t is0 = bd_find(d, seeds[0]);
         if (is0 >= 0) bd_add(d, 1ULL, (uint32_t)is0, (uint32_t)is0, OP_DIV, 1, 0);
@@ -2687,16 +2905,14 @@ EXPORT void* fe_local_create(
         cur *= 2ULL;
     }
 
-    /* Pairwise power-of-2 products */
+    /* Power-of-2 products */
     for (int pass = 0; pass < 3; pass++) {
         uint32_t lim = d->n;
         for (uint32_t i = 0; i < lim && d->n < cap; i++) {
-            uint64_t a = d->vals[i];
-            if ((a & (a - 1)) != 0) continue;
+            uint64_t a = d->vals[i]; if ((a & (a - 1)) != 0) continue;
             uint8_t ca = meta_cost(d->meta[i]);
             for (uint32_t j = i; j < lim && d->n < cap; j++) {
-                uint64_t b = d->vals[j];
-                if ((b & (b - 1)) != 0) continue;
+                uint64_t b = d->vals[j]; if ((b & (b - 1)) != 0) continue;
                 u128 p = (u128)a * (u128)b;
                 if (p <= (u128)vl) bd_add(d, (uint64_t)p, i, j, OP_MUL, ca + meta_cost(d->meta[j]) + 1, 0);
             }
@@ -2745,15 +2961,15 @@ EXPORT void* fe_local_create(
         }
     }
 
-    /* Layer 2: top-down expansion from balanced low-cost representatives per bit bucket */
-    uint32_t max_reps = 50U * 400U;
+    /* Layer 2: bounded representative pairs (~10,000 reps -> fast) */
+    uint32_t max_reps = 44U * 220U;
     uint32_t *reps = (uint32_t *)malloc(sizeof(uint32_t) * max_reps);
     uint32_t nr = 0;
     if (reps) {
-        for (int bl = 1; bl <= 42 && nr < max_reps; bl++) {
+        for (int bl = 1; bl <= 40 && nr < max_reps; bl++) {
             int cnt = 0;
-            for (int tc = 0; tc <= 11 && cnt < 300 && nr < max_reps; tc++) {
-                for (uint32_t k = 0; k < d->n && cnt < 300 && nr < max_reps; k++) {
+            for (int tc = 0; tc <= 11 && cnt < 220 && nr < max_reps; tc++) {
+                for (uint32_t k = 0; k < d->n && cnt < 220 && nr < max_reps; k++) {
                     if (bl64(d->vals[k]) == bl && meta_cost(d->meta[k]) == tc) {
                         reps[nr++] = k;
                         cnt++;
@@ -2767,8 +2983,8 @@ EXPORT void* fe_local_create(
             for (int32_t rj = 0; rj <= ri && d->n < cap; rj++) {
                 uint32_t ib = reps[rj];
                 uint64_t b = d->vals[ib]; uint8_t cb = meta_cost(d->meta[ib]);
-                uint8_t nc = (ca + cb + 1) > 15 ? 15 : (ca + cb + 1);
                 if (ca + cb + 1 > 16) continue;
+                uint8_t nc = (ca + cb + 1) > 15 ? 15 : (ca + cb + 1);
                 u128 p = (u128)a * (u128)b;
                 if (p <= (u128)vl) bd_add(d, (uint64_t)p, ia, ib, OP_MUL, nc, 1);
                 u128 s = (u128)a + (u128)b;
@@ -2783,14 +2999,16 @@ EXPORT void* fe_local_create(
         free(reps);
     }
 
-    /* Layer 3 (if high local budget remains): fast strided base cross */
+    /* Layer 3 (fast, bounded at <= 150k x 600 cheap base constants -> <0.8s!) */
     uint32_t cur_n = d->n;
     if (d->n < cap && cur_n > base_end) {
-        for (uint32_t i = base_end; i < cur_n && d->n < cap; i += 3) {
+        uint32_t j_lim = base_end < 600U ? base_end : 600U;
+        uint32_t i_step = (cur_n - base_end) > 150000U ? ((cur_n - base_end) / 150000U) : 1U;
+        for (uint32_t i = base_end; i < cur_n && d->n < cap; i += i_step) {
             uint64_t a = d->vals[i];
-            if (bl64(a) > 36) continue;
+            if (bl64(a) > 38) continue;
             uint8_t ca = meta_cost(d->meta[i]);
-            for (uint32_t j = 0; j < base_end && d->n < cap; j++) {
+            for (uint32_t j = 0; j < j_lim && d->n < cap; j++) {
                 uint64_t b = d->vals[j];
                 uint8_t cb = meta_cost(d->meta[j]);
                 uint8_t nc = (ca + cb + 1) > 15 ? 15 : (ca + cb + 1);
@@ -2807,7 +3025,7 @@ EXPORT void* fe_local_create(
         }
     }
 
-    /* Build stratified sorted `scan_vals` up to `scan_cap` for O(N) 2-pointer */
+    /* Build stratified sorted scan slice up to scan_cap */
     uint32_t ns_tot = d->n < scan_cap ? d->n : scan_cap;
     SortPair *sp = (SortPair *)malloc(sizeof(SortPair) * ns_tot);
     d->scan_vals  = (uint64_t *)malloc(sizeof(uint64_t) * ns_tot);
@@ -2821,7 +3039,6 @@ EXPORT void* fe_local_create(
                 filled++;
             }
         } else {
-            /* Keep all base nodes + balanced stride up to scan_cap */
             uint32_t keep_front = base_end < (ns_tot / 3) ? base_end : (ns_tot / 3);
             for (uint32_t i = 0; i < keep_front; i++) {
                 sp[filled].v = d->vals[i];
@@ -2843,6 +3060,7 @@ EXPORT void* fe_local_create(
             d->scan_costs[i] = sp[i].c;
         }
         d->n_scan = filled;
+        d->alloc_bytes += (uint64_t)(sizeof(uint64_t) + sizeof(uint8_t)) * ns_tot;
     }
     free(sp);
     return d;
@@ -2850,7 +3068,10 @@ EXPORT void* fe_local_create(
 
 typedef struct { uint64_t d1, d2, prod, gap; int32_t metric; uint8_t sgn; } Hit;
 
-/* Combined Two-Pointer scan over `D_local` consulting Universal `U` for residual lookup! */
+/*
+ * Fast O(N) Two-Pointer Scan with zero multi-GB DRAM misses:
+ * Uses L3-resident `seen24` bitsets for instant ~1ns residual hit checks!
+ */
 EXPORT int fe_two_pointer(
     void *p_local, void *p_univ, uint64_t tgt, int K,
     uint64_t *od1, uint64_t *od2, uint64_t *oprod, uint64_t *ogap, int *osgn
@@ -2866,6 +3087,8 @@ EXPORT int fe_two_pointer(
     int Kg = K / 2; if (Kg < 1) Kg = 1; if (Kg > 32) Kg = 32;
     int Ks = K - Kg; if (Ks > 32) Ks = 32;
 
+    const uint64_t *d_s24 = d->seen24;
+    const uint64_t *u_s24 = u ? u->seen24 : NULL;
     int i = 0, j = N - 1;
     u128 t128 = (u128)tgt;
     u128 vl128 = (u128)d->vl;
@@ -2887,11 +3110,10 @@ EXPORT int fe_two_pointer(
             if (Ks > 0) {
                 int g_est = 0;
                 if (g > 0) {
-                    int32_t id = bd_find(d, g);
-                    if (id >= 0) g_est = (int)meta_cost(d->meta[id]);
-                    else if (u) {
-                        int32_t iu = bd_find(u, g);
-                        g_est = (iu >= 0) ? ((int)meta_cost(u->meta[iu]) + 1) : (bl64(g) / 3 + 3);
+                    if (g < (1ULL << 24)) {
+                        if (d_s24 && (d_s24[g >> 6] & (1ULL << (g & 63)))) g_est = 4;
+                        else if (u_s24 && (u_s24[g >> 6] & (1ULL << (g & 63)))) g_est = 5;
+                        else g_est = bl64(g) / 3 + 2;
                     } else {
                         g_est = bl64(g) / 3 + 2;
                     }
@@ -2942,7 +3164,6 @@ static inline void mitm_push(
     }
 }
 
-/* Lookup cost of `x` across `D_local` (preferred) or `U`; -1 if missing. */
 static inline int lookup_cost_both(const BigDict *d, const BigDict *u, uint64_t x) {
     int32_t id = bd_find(d, x);
     if (id >= 0) return (int)meta_cost(d->meta[id]);
@@ -2954,10 +3175,9 @@ static inline int lookup_cost_both(const BigDict *d, const BigDict *u, uint64_t 
 }
 
 /*
- * Bidirectional Meet-in-the-Middle quotient-remainder probe `T = a * q +- r`:
- *   1. Probes all `active` DAG values FIRST (marginal cost(a) = 0).
- *   2. Probes lowest-cost divisors in `D_local` (`scan` + low indices) and `U` (`<= max_u_scan`).
- * Returns exact triples `(a, q, r)` where `q, r in D_local U U` AND near-hits where `r < 2^22`.
+ * Bidirectional C99 MITM probe `T = a * q +- r`:
+ * Scans active DAG nodes + D_local + high-yield Universal U divisors (`u->scan_vals`,
+ * covering `<2^20` and `24..34`-bit bands!).
  */
 EXPORT int fe_mitm_probe(
     void *p_local, void *p_univ, uint64_t tgt, uint64_t vl,
@@ -2970,7 +3190,6 @@ EXPORT int fe_mitm_probe(
     MitmHit hits[48];
     int nh = 0, wh = 0;
 
-    /* Helper macro-like inline logic per candidate divisor `a` with base cost `ca` */
     #define TRY_DIVISOR(A_VAL, CA_VAL) do { \
         uint64_t a_v = (A_VAL); \
         if (a_v > 1ULL && a_v <= tgt) { \
@@ -3005,22 +3224,26 @@ EXPORT int fe_mitm_probe(
         } \
     } while (0)
 
-    /* 1. Active DAG values: zero marginal ancestor cost! */
     for (int i = 0; i < n_act; i++) {
         TRY_DIVISOR(act_vals[i], 0);
     }
 
-    /* 2. Seed-local dictionary divisors */
     uint32_t d_lim = d->n < max_div_scan ? d->n : max_div_scan;
     for (uint32_t i = 0; i < d_lim; i++) {
         TRY_DIVISOR(d->vals[i], (int)meta_cost(d->meta[i]));
     }
 
-    /* 3. Universal U divisors (includes full <2^20 and dense 24..34-bit mid divisors) */
-    if (u) {
-        uint32_t u_lim = u->n < max_div_scan ? u->n : max_div_scan;
-        for (uint32_t i = 1; i < u_lim; i++) {
-            TRY_DIVISOR(u->vals[i], (int)meta_cost(u->meta[i]) + 1);
+    if (u && max_div_scan > 0) {
+        if (u->scan_vals && u->n_scan > 0) {
+            uint32_t u_lim = u->n_scan < max_div_scan ? u->n_scan : max_div_scan;
+            for (uint32_t i = 0; i < u_lim; i++) {
+                TRY_DIVISOR(u->scan_vals[i], (int)u->scan_costs[i] + 1);
+            }
+        } else {
+            uint32_t u_lim = u->n < max_div_scan ? u->n : max_div_scan;
+            for (uint32_t i = 1; i < u_lim; i++) {
+                if (u->vals[i] > 1ULL) TRY_DIVISOR(u->vals[i], (int)meta_cost(u->meta[i]) + 1);
+            }
         }
     }
 
@@ -3033,18 +3256,12 @@ EXPORT int fe_mitm_probe(
     return nh;
 }
 
-/*
- * Fast C99 trial division over `primes[np]` to score smooth candidates `T + k` in < 1ms.
- * Outputs `out_score[i]` = small score (number of prime factors + residual bit length/4);
- * lower is smoother!
- */
 EXPORT void fe_screen_smooth(
     uint64_t tgt, uint64_t vl, const int32_t *ks, int nk,
     const uint32_t *primes, int np, int32_t *out_sc
 ) {
     for (int i = 0; i < nk; i++) {
         int64_t k = (int64_t)ks[i];
-        int64_t cand_s = (k >= 0) ? 1 : -1;
         uint64_t cand;
         if (k >= 0) {
             if (tgt > vl - (uint64_t)k) { out_sc[i] = 9999; continue; }
@@ -3059,14 +3276,10 @@ EXPORT void fe_screen_smooth(
         for (int pi = 0; pi < np; pi++) {
             uint32_t p = primes[pi];
             if ((u128)p * (u128)p > (u128)n) break;
-            while (n % p == 0) {
-                n /= p;
-                facs++;
-            }
+            while (n % p == 0) { n /= p; facs++; }
         }
         int rb = (n <= 1ULL) ? 0 : bl64(n);
         out_sc[i] = facs + (rb > 0 ? (rb / 3 + 2) : 0) + (k == 0 ? 0 : 1);
-        (void)cand_s;
     }
 }
 '''
@@ -3075,17 +3288,14 @@ _CLIB_CACHE = None
 _CLIB_FAILED = False
 _OP_MAP = {1: "+", 2: "-", 3: "*", 4: "/"}
 
-# Shared global Universal `{1}`-Dictionary context (Read-Only after init for Linux fork CoW)
 _UNIV_CTX: Optional[int] = None
 _UNIV_CAP: int = 0
 _UNIV_SIZE: int = 0
+_UNIV_BYTES: int = 0
 
 
 def get_clib() -> Optional[ctypes.CDLL]:
-    """
-    Lazily compile and load the V5 C99 acceleration library in tempdir.
-    Safe under concurrent multiprocessing (atomic temp write + rename).
-    """
+    """Lazily compile and load the V6 4-thread sharded C99 shared library."""
     global _CLIB_CACHE, _CLIB_FAILED
     if _CLIB_CACHE is not None:
         return _CLIB_CACHE
@@ -3098,15 +3308,16 @@ def get_clib() -> Optional[ctypes.CDLL]:
     try:
         ext = ".dll" if os.name == "nt" else ".so"
         tdir = tempfile.gettempdir()
-        so_path = os.path.join(tdir, f"santa2026_fast_engine_v5{ext}")
+        so_path = os.path.join(tdir, f"santa2026_fast_engine_v6{ext}")
         if not os.path.exists(so_path):
             pid = os.getpid()
-            c_path = os.path.join(tdir, f"santa2026_fast_engine_v5_{pid}.c")
-            tmp_so = os.path.join(tdir, f"santa2026_fast_engine_v5_{pid}{ext}")
+            c_path = os.path.join(tdir, f"santa2026_fast_engine_v6_{pid}.c")
+            tmp_so = os.path.join(tdir, f"santa2026_fast_engine_v6_{pid}{ext}")
             with open(c_path, "w", encoding="utf-8") as f:
                 f.write(_C_SOURCE)
+            flags = ["gcc", "-O3", "-shared", "-fPIC"] + ([] if os.name == "nt" else ["-pthread"])
             subprocess.run(
-                ["gcc", "-O3", "-shared", "-fPIC", c_path, "-o", tmp_so],
+                flags + [c_path, "-o", tmp_so],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -3123,7 +3334,7 @@ def get_clib() -> Optional[ctypes.CDLL]:
                 pass
 
         lib = ctypes.CDLL(so_path)
-        lib.fe_univ_create.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        lib.fe_univ_create.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int]
         lib.fe_univ_create.restype = ctypes.c_void_p
 
         lib.fe_local_create.argtypes = [
@@ -3137,6 +3348,8 @@ def get_clib() -> Optional[ctypes.CDLL]:
         lib.fe_dict_size.restype = ctypes.c_uint32
         lib.fe_scan_size.argtypes = [ctypes.c_void_p]
         lib.fe_scan_size.restype = ctypes.c_uint32
+        lib.fe_dict_bytes.argtypes = [ctypes.c_void_p]
+        lib.fe_dict_bytes.restype = ctypes.c_uint64
         lib.fe_dict_lookup.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
         lib.fe_dict_lookup.restype = ctypes.c_int32
         lib.fe_dict_get.argtypes = [
@@ -3180,57 +3393,67 @@ def get_clib() -> Optional[ctypes.CDLL]:
 
 
 def init_universal_dict(
-    ram_gb: str | float = "auto", *, force_python: bool = False
+    ram_gb: str | float = "auto", *, force_python: bool = False, n_threads: Optional[int] = None
 ) -> dict[str, int | float | str]:
     """
-    Build the global parent-shared read-only `{1}` Universal Dictionary `U` once.
-    On Linux `fork()`, all worker processes share `U` via Copy-on-Write (`1x` RAM).
-    Automatically steps down capacity cleanly if host allocation returns NULL.
+    Build the global parent-shared read-only `{1}` Universal Dictionary `U` once across
+    `n_threads` OS threads. Shared 1x Copy-on-Write across Linux `fork()` workers.
     """
-    global _UNIV_CTX, _UNIV_CAP, _UNIV_SIZE
+    global _UNIV_CTX, _UNIV_CAP, _UNIV_SIZE, _UNIV_BYTES
     prof = dict(get_ram_profile(ram_gb))
     if force_python:
-        return {**prof, "univ_size": 0, "c99": 0}
+        return {**prof, "univ_size": 0, "univ_gb": 0.0, "c99": 0}
 
     lib = get_clib()
     if lib is None:
-        return {**prof, "univ_size": 0, "c99": 0}
+        return {**prof, "univ_size": 0, "univ_gb": 0.0, "c99": 0}
 
     target_cap = int(prof["univ_cap"])
     target_pow = int(prof["univ_ht_pow"])
     if _UNIV_CTX is not None and _UNIV_CAP >= target_cap:
-        return {**prof, "univ_size": _UNIV_SIZE, "c99": 1}
+        return {**prof, "univ_size": _UNIV_SIZE, "univ_gb": _UNIV_BYTES / 1e9, "c99": 1}
 
     if _UNIV_CTX is not None:
         lib.fe_dict_free(_UNIV_CTX)
         _UNIV_CTX = None
         _UNIV_CAP = 0
         _UNIV_SIZE = 0
+        _UNIV_BYTES = 0
 
+    nt = n_threads if n_threads is not None else min(4, max(1, os.cpu_count() or 1))
     cap = target_cap
     htp = target_pow
     while cap >= 2_000_000:
-        ctx = lib.fe_univ_create(ctypes.c_uint32(cap), ctypes.c_uint32(htp))
+        ctx = lib.fe_univ_create(ctypes.c_uint32(cap), ctypes.c_uint32(htp), ctypes.c_int(nt))
         if ctx:
             _UNIV_CTX = ctx
             _UNIV_CAP = cap
             _UNIV_SIZE = int(lib.fe_dict_size(ctx))
-            return {**prof, "univ_cap": cap, "univ_ht_pow": htp, "univ_size": _UNIV_SIZE, "c99": 1}
-        cap //= 2
-        if htp > 23:
+            _UNIV_BYTES = int(lib.fe_dict_bytes(ctx))
+            return {
+                **prof,
+                "univ_cap": cap,
+                "univ_ht_pow": htp,
+                "univ_size": _UNIV_SIZE,
+                "univ_gb": _UNIV_BYTES / 1e9,
+                "c99": 1,
+            }
+        cap = (cap * 2) // 3
+        if htp > 23 and (1 << (htp - 1)) >= cap * 2:
             htp -= 1
 
-    return {**prof, "univ_size": 0, "c99": 0}
+    return {**prof, "univ_size": 0, "univ_gb": 0.0, "c99": 0}
 
 
 def release_universal_dict() -> None:
-    """Free the global Universal Dictionary cleanly (useful in unit tests)."""
-    global _UNIV_CTX, _UNIV_CAP, _UNIV_SIZE
+    """Free the global Universal Dictionary cleanly."""
+    global _UNIV_CTX, _UNIV_CAP, _UNIV_SIZE, _UNIV_BYTES
     if _UNIV_CTX is not None and _CLIB_CACHE is not None:
         _CLIB_CACHE.fe_dict_free(_UNIV_CTX)
     _UNIV_CTX = None
     _UNIV_CAP = 0
     _UNIV_SIZE = 0
+    _UNIV_BYTES = 0
 
 
 # ---------------------------------------------------------------------------
@@ -3395,7 +3618,7 @@ class _PyDictBackend:
 
 class DictEngine:
     """
-    Unified interface to the C99 Universal+Local (or pure-Python fallback)
+    Unified interface to the V6 C99 Universal+Local (or pure-Python fallback)
     dictionary & Meet-in-the-Middle engine. Always use via `with DictEngine(puzzle) as de:`.
     """
 
@@ -3432,7 +3655,6 @@ class DictEngine:
         self.clib = None if force_python else get_clib()
         if self.clib is not None and self.vl < (1 << 63) and self.seeds:
             arr = (ctypes.c_uint64 * len(self.seeds))(*self.seeds)
-            # Retry step-down if local allocation fails
             c_try, h_try = cap, ht_pow
             while c_try >= 200_000:
                 self.ctx = self.clib.fe_local_create(
@@ -3511,7 +3733,6 @@ class DictEngine:
             self._node_cache[v] = res
             return res
 
-        # 1. Prefer seed-local definition (often much shorter via puzzle seeds)
         idx = self.clib.fe_dict_lookup(self.ctx, ctypes.c_uint64(v))
         src_ctx = self.ctx
         if idx < 0 and self.univ_ctx is not None:
@@ -3562,8 +3783,8 @@ class DictEngine:
     ) -> list[tuple[int, int, int, int, int]]:
         """
         Bidirectional C99 MITM quotient-remainder probe `T = a * q +- r`:
-          - Caches the expensive static `D_local U U` divisor scan ONCE per `tgt`.
-          - Always probes current `active_vals` (marginal cost = 0) dynamically (<0.05ms).
+          - Caches the static `D_local U U` divisor scan ONCE per `tgt`.
+          - Always probes current `active_vals` (marginal cost = 0) dynamically.
         """
         if self.py_backend is not None or self.ctx is None or tgt <= 100:
             return []
@@ -5303,47 +5524,88 @@ def run(
     # Pre-warm C99 acceleration + Shared Universal `{1}`-Dict U BEFORE fork()
     backend_name = "Python fallback"
     try:
-# [bundled]         from src.solvers.fast_engine import init_universal_dict
+# [bundled]         from src.solvers.fast_engine import init_universal_dict, get_ram_telemetry, get_ram_profile
+        prof0 = get_ram_profile(ram_gb)
+        t0_mem = get_ram_telemetry()
+        if verbose:
+            print(
+                f"Host RAM pre-init: Used {t0_mem['used_gb']:.2f} / {t0_mem['total_gb']:.2f} GB "
+                f"(Avail {t0_mem['avail_gb']:.2f} GB) | Target profile={prof0['mode']} "
+                f"(U_cap={int(prof0['univ_cap']):,}, D_local={int(prof0['local_cap']):,}/worker)",
+                flush=True,
+            )
+        t_u = time.monotonic()
         info = init_universal_dict(ram_gb=ram_gb)
+        dt_u = time.monotonic() - t_u
         if info.get("c99"):
             u_n = int(info.get("univ_size", 0))
+            u_gb = float(info.get("univ_gb", 0.0))
             mode = info.get("mode", "auto")
-            backend_name = f"C99 __int128 [{mode}, U={u_n:,} nodes]"
+            t1_mem = get_ram_telemetry()
+            backend_name = f"C99 __int128 [{mode}, U={u_n:,} nodes, {u_gb:.2f} GB CoW]"
+            if verbose:
+                print(
+                    f"Universal U ready in {dt_u:.1f}s: {u_n:,} nodes ({u_gb:.2f} GB shared CoW) | "
+                    f"Host RAM Used {t1_mem['used_gb']:.2f} / {t1_mem['total_gb']:.2f} GB "
+                    f"(Avail {t1_mem['avail_gb']:.2f} GB, Proc RSS {t1_mem['proc_rss_gb']:.2f} GB)",
+                    flush=True,
+                )
     except Exception:
         pass
 
     if verbose:
-        print(f"Loaded {len(puzzles)} puzzles. Solving with {cores} core(s) [{backend_name}]...")
+        print(f"Loaded {len(puzzles)} puzzles. Solving with {cores} core(s) [{backend_name}]...", flush=True)
 
     # Build arguments for workers
     worker_args = [(p, sa_time, n_starts, ram_gb, verbose and cores == 1) for p in puzzles]
 
     results: dict[str, list[Instruction]] = {}
+    running_total = 0
+
+    def _log_progress(pid: str, count: int) -> None:
+        nonlocal running_total
+        running_total += count
+        if not verbose:
+            return
+        done = len(results)
+        if done % 25 == 0 or done == len(puzzles):
+            el = time.monotonic() - total_start
+            try:
+# [bundled]                 from src.solvers.fast_engine import get_ram_telemetry
+                tm = get_ram_telemetry()
+                mem_s = f" | RAM Used {tm['used_gb']:.2f}/{tm['total_gb']:.2f} GB (Avail {tm['avail_gb']:.2f} GB)"
+            except Exception:
+                mem_s = ""
+            print(
+                f"  {pid}: {count} instructions  [{done}/{len(puzzles)} | sum={running_total:,} | {el:.1f}s{mem_s}]",
+                flush=True,
+            )
+        else:
+            print(f"  {pid}: {count} instructions", flush=True)
 
     if cores > 1:
-        chunksize = max(1, len(puzzles) // (cores * 4))
+        # chunksize=1 guarantees immediate per-puzzle streaming logs with zero batch stalls
         try:
             with multiprocessing.Pool(processes=cores) as pool:
-                for pid, prog_lists, count in pool.imap_unordered(_worker, worker_args, chunksize=chunksize):
+                for pid, prog_lists, count in pool.imap_unordered(_worker, worker_args, chunksize=1):
 # [bundled]                     from src.utils import Instruction
                     results[pid] = [Instruction(*row) for row in prog_lists]
-                    if verbose:
-                        print(f"  {pid}: {count} instructions")
+                    _log_progress(pid, count)
         except Exception as e:
             if verbose:
-                print(f"Worker pool encountered {e}; executing remaining on main process...")
+                print(f"Worker pool encountered {e}; executing remaining on main process...", flush=True)
             for puzzle in puzzles:
                 if puzzle.id not in results:
                     pid, prog_lists, count = _worker((puzzle, sa_time, n_starts, ram_gb, verbose))
 # [bundled]                     from src.utils import Instruction
                     results[pid] = [Instruction(*row) for row in prog_lists]
-                    if verbose:
-                        print(f"  {pid}: {count} instructions")
+                    _log_progress(pid, count)
     else:
         for puzzle in puzzles:
             pid, prog_lists, count = _worker((puzzle, sa_time, n_starts, ram_gb, verbose))
 # [bundled]             from src.utils import Instruction
             results[pid] = [Instruction(*row) for row in prog_lists]
+            _log_progress(pid, count)
 
     # Write submission
     write_submission(results, out_path)

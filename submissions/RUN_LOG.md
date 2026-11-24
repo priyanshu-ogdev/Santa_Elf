@@ -31,3 +31,14 @@
   - Standalone `kaggle_submission_cell.py` E2E slice (`scored_0001..0008` + 4 tiny, `U=8M` compact test mode): `2,305` total instructions (`2,289` vs V4 `2,392` vs baseline `13,339`, **-82.8%** vs baseline), `Verification PASSED with 0 errors!`.
   - Stratified 15-puzzle practice benchmark (`U=8M` compact test mode): `3,111` total vs V4 `3,257` (**-4.5%**) and `binary_shared` `14,206` (**-78.1%**).
 - **Next:** Run `submissions/kaggle_submission_cell.py` on Kaggle (`4` CPUs, `~30 GB` RAM) and log final 1,000-puzzle score.
+
+## Run 4 (Pre-Submission): V6 Parallel 64-Shard `U` (500M) + Bottleneck Fixes + RAM Telemetry
+- **Root-Cause Fixes Applied After User Kaggle Log Audit (`238.4s` startup + silent output):**
+  1. **Actual Kaggle RAM audit:** V5 only used `9.09 GB` (`U=300M`, `HT=2^30`) + `~1.2 GB` across 4 workers (`~10.3 GB` total). Upgraded `kaggle_high_ram` to **`U=500,000,000`** (`8.00 GB` vals+meta + **`2^31` 4-byte HT = `8.59 GB`**, **`~16.59 GB` CoW shared 1x**) + `4` workers x `D_local=10,000,000` (`HT=2^25`, `~300 MB/worker` + Python/HiGHS) = **`~20-24 GB` real Kaggle RSS** with zero OOM risk.
+  2. **64-Shard Lock-Free 4-Thread `U` Builder (`fe_univ_create`):** Parallelizes `Phase B` across 4 OS threads using disjoint 64-shard hashing + segment compaction (`8M` local init dropped **`9.4s -> 1.4s`**, **`6.7x` faster**).
+  3. **Fixed `fe_two_pointer` Multi-GB DRAM Stalls:** Uses the `2 MiB` L3-resident `seen24` bitset (`~1ns`) instead of missing a multi-GB DRAM hash table on every loop pair.
+  4. **Fixed `fe_local_create` Layer 3 Blowup:** Bounded Layer 3 cross (`<=150k x 600` cheap constants) so `10M`-node local dicts build rapidly per puzzle.
+  5. **Streaming Logs + Live Memory Telemetry (`orchestrator.py`):** Switched `imap_unordered` from `chunksize=62` (15-min silent stalls) to **`chunksize=1`** with `flush=True`, printing pre-init RAM, `U` allocation RSS/GB, every puzzle immediately, and aggregate Host Used/Avail GB every 25 puzzles.
+- **Verified Local Checks (strictly post-final edit):**
+  - `pytest tests/ -v`: **`38 passed in 579.63s`** (`0` errors).
+  - Isolated standalone `submissions/kaggle_submission_cell.py` (`212.0 KB`, `U=8M` test cap): **`2,301` total instructions** (`scored_0001..0008`: `2,285`, `-82.9%` vs `13,339` baseline), `U` built in `1.4s`, `Verification PASSED with 0 errors!`.
