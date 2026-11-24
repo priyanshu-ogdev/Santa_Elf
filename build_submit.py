@@ -1,0 +1,214 @@
+"""
+build_submit.py
+Assembles submit.py in the project root -- a single self-contained Python file
+that bundles all src/ modules inline (no external imports from src/).
+
+Each solver module's top-level `solve()` function is renamed to `{module}_solve()`
+to avoid name collisions in the flat namespace. Immediately after all solver modules
+are inlined, shim namespace objects are injected so caller modules (such as
+orchestrator.py, tiny_bfs.py, and dag_synthesizer.py) can call fallback.solve(...)
+etc. cleanly in the flat namespace.
+
+Usage:
+    python build_submit.py
+
+Output: submit.py and submissions/kaggle_submission_cell.py.
+"""
+import os
+import re
+import sys
+
+# ---------------------------------------------------------------------------
+# Module list in inlining order.
+# (prefix, rel_path) — prefix is the solver name used to disambiguate `solve()`
+# ---------------------------------------------------------------------------
+SOURCE_FILES = [
+    (None,              "src/utils.py"),
+    (None,              "src/verifier.py"),
+    (None,              "src/classifier.py"),
+    (None,              "src/dag_compiler.py"),
+    ("fallback",        "src/solvers/fallback.py"),
+    ("tiny_bfs",        "src/solvers/tiny_bfs.py"),
+    ("meet_in_middle",  "src/solvers/meet_in_middle.py"),
+    ("delta_cluster",   "src/solvers/delta_cluster.py"),
+    ("factor_smooth",   "src/solvers/factor_smooth.py"),
+    ("binary_shared",   "src/solvers/binary_shared.py"),
+    (None,              "src/solvers/fast_engine.py"),
+    ("dag_synthesizer", "src/solvers/dag_synthesizer.py"),
+    (None,              "src/postpass.py"),
+    (None,              "src/orchestrator.py"),
+]
+
+INTERNAL_PREFIXES = (
+    "from src.",
+    "import src.",
+    "from src import",
+)
+
+SKIP_LINES = {
+    "from __future__ import annotations",
+}
+
+# ---------------------------------------------------------------------------
+# Solver shim injected after all solvers are inlined (before postpass/orchestrator).
+# ---------------------------------------------------------------------------
+SHIM_BLOCK = """\
+
+# ===========================================================================
+# SOLVER NAMESPACE SHIMS
+# (allow cross-solver & orchestrator calls to solver.solve(...) in flat namespace)
+# ===========================================================================
+class _NS:
+    \"\"\"Tiny namespace shim — exposes a single callable as .solve\"\"\"
+    def __init__(self, fn): self.solve = fn
+
+fallback        = _NS(fallback_solve)
+tiny_bfs        = _NS(tiny_bfs_solve)
+meet_in_middle  = _NS(meet_in_middle_solve)
+delta_cluster   = _NS(delta_cluster_solve)
+factor_smooth   = _NS(factor_smooth_solve)
+binary_shared   = _NS(binary_shared_solve)
+dag_synthesizer = _NS(dag_synthesizer_solve)
+"""
+
+
+def process_file(raw_lines, solver_prefix=None):
+    """
+    Process one source file:
+    - Drop `from __future__ import annotations` (one global one is in HEADER)
+    - Comment out internal `from src.*` / `import src.*` imports
+      (including paren-balanced multi-line variants)
+    - If solver_prefix is set, rename `def solve(` -> `def {solver_prefix}_solve(`
+    - Strip any trailing `if __name__ == "__main__":` block from bundled modules
+      so only the single entry point in FOOTER remains.
+    """
+    result = []
+    in_stripped_multiline = False
+    paren_balance = 0
+    in_main_block = False
+
+    for line in raw_lines:
+        stripped = line.strip()
+
+        if stripped in SKIP_LINES:
+            continue
+
+        if stripped in ('if __name__ == "__main__":', "if __name__ == '__main__':"):
+            in_main_block = True
+            result.append(f"# [bundled-main] {line.rstrip()}\n")
+            continue
+
+        if in_main_block:
+            if line.startswith(" ") or line.startswith("\t") or stripped == "":
+                result.append(f"# [bundled-main] {line.rstrip()}\n")
+                continue
+            else:
+                in_main_block = False
+
+        if in_stripped_multiline:
+            result.append(f"# [bundled-cont] {line.rstrip()}\n")
+            paren_balance += stripped.count("(") - stripped.count(")")
+            if paren_balance <= 0:
+                in_stripped_multiline = False
+            continue
+
+        is_internal = any(stripped.startswith(p) for p in INTERNAL_PREFIXES)
+        if is_internal:
+            result.append(f"# [bundled] {line.rstrip()}\n")
+            opens = stripped.count("(")
+            closes = stripped.count(")")
+            if opens > closes:
+                in_stripped_multiline = True
+                paren_balance = opens - closes
+            continue
+
+        if solver_prefix and re.match(r'^def solve\(', stripped):
+            line = line.replace("def solve(", f"def {solver_prefix}_solve(", 1)
+
+        result.append(line)
+
+    return result
+
+
+HEADER = '''\
+#!/usr/bin/env python3
+"""
+submit.py -- Santa 2026 Elf Calculator -- Self-contained solver
+Generated by build_submit.py. Do not edit this file; edit src/ instead.
+
+Usage:
+    python submit.py --puzzles data/puzzles.csv --out submissions/sub.csv --cores 4 --verify
+"""
+# Standard library imports (consolidated from all modules)
+from __future__ import annotations
+import argparse
+import bisect
+import csv
+import ctypes
+import heapq
+import json
+import math
+import multiprocessing
+import os
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import NamedTuple, Optional
+
+'''
+
+FOOTER = '''
+
+# ===========================================================================
+# ENTRY POINT
+# ===========================================================================
+if __name__ == "__main__" or "ipykernel" in sys.modules:
+    _cli()
+'''
+
+
+def build():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    out_path_submit = os.path.join(base_dir, "submit.py")
+    out_dir_sub = os.path.join(base_dir, "submissions")
+    os.makedirs(out_dir_sub, exist_ok=True)
+    out_path_cell = os.path.join(out_dir_sub, "kaggle_submission_cell.py")
+
+    sections = []
+    for solver_prefix, rel_path in SOURCE_FILES:
+        full_path = os.path.join(base_dir, rel_path.replace("/", os.sep))
+        if not os.path.exists(full_path):
+            print(f"ERROR: Missing {full_path}", file=sys.stderr)
+            sys.exit(1)
+
+        with open(full_path, encoding="utf-8") as f:
+            raw_lines = f.readlines()
+
+        processed = process_file(raw_lines, solver_prefix=solver_prefix)
+
+        label = rel_path.replace("/", ".").replace("\\", ".")
+        sep = "=" * 75
+        sections.append(f"\n# {sep}\n# MODULE: {label}\n# {sep}\n")
+        sections.append("".join(processed))
+
+        if solver_prefix == "dag_synthesizer":
+            sections.append(SHIM_BLOCK)
+
+    full_content = HEADER + "".join(sections) + FOOTER
+
+    for target_path in (out_path_submit, out_path_cell):
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.write(full_content)
+        size_kb = os.path.getsize(target_path) / 1024
+        print(f"Built {target_path} ({size_kb:.1f} KB)")
+    print("Run:  python submit.py --help")
+
+
+if __name__ == "__main__":
+    build()
