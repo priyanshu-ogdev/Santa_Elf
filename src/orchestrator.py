@@ -123,8 +123,9 @@ def solve_puzzle(
             r = verify_program(puzzle, prog)
             if r.valid:
                 candidates.append(prog)
-        except Exception:
-            pass
+        except Exception as e:
+            if verbose:
+                print(f"  [warn] dag_synthesizer failed on {puzzle.id}: {e!r}", flush=True)
 
     # --- C99 2-step Value-Set Beam Search (joint intermediate sharing for small/medium ranges) ---
     if 40 <= puzzle.value_limit and puzzle.targets and max(puzzle.targets) <= 25_000_000 and len(puzzle.targets) <= 15:
@@ -138,14 +139,16 @@ def solve_puzzle(
         except Exception:
             pass
 
-    # --- binary_shared (secondary wNAF ensemble — fast baseline) ---
-    try:
-        prog = binary_shared.solve(puzzle)
-        r = verify_program(puzzle, prog)
-        if r.valid:
-            candidates.append(prog)
-    except Exception:
-        pass
+    # --- binary_shared (secondary wNAF safety net — skip when DAG already beats 55% bit-budget) ---
+    bit_thresh = max(40, (sum(t.bit_length() for t in puzzle.targets) * 55) // 100)
+    if not candidates or min(len(c) for c in candidates) > bit_thresh:
+        try:
+            prog = binary_shared.solve(puzzle)
+            r = verify_program(puzzle, prog)
+            if r.valid:
+                candidates.append(prog)
+        except Exception:
+            pass
 
     # --- Specialised small-range solvers (fast path for < 10^7 targets) ---
     if max(puzzle.targets) < 10**7 and label != PuzzleClass.TINY:
@@ -264,8 +267,9 @@ def run(
                     f"(Avail {t1_mem['avail_gb']:.2f} GB, Proc RSS {t1_mem['proc_rss_gb']:.2f} GB)",
                     flush=True,
                 )
-    except Exception:
-        pass
+    except Exception as e:
+        if verbose:
+            print(f"Warning: C99 universal dict init failed ({e!r}); falling back to Python.", flush=True)
 
     if verbose:
         print(f"Loaded {len(puzzles)} puzzles. Solving with {cores} core(s) [{backend_name}]...", flush=True)

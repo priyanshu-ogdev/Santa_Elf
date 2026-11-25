@@ -149,6 +149,39 @@ def _sub_dag_new_nodes(
     local_edges: dict[int, tuple[str, int, int]] = {}
     vl = de.vl
     seeds = de.seeds_set
+    if len(ops_list) == 1:
+        op0, a0, b0, r0 = ops_list[0]
+        if apply_op(op0, a0, b0, vl) != r0:
+            return None
+        added[r0] = (op0, a0, b0)
+        stk = []
+        if a0 not in seeds and a0 not in active_defs:
+            if a0 == r0:
+                return None
+            stk.append(a0)
+        if b0 not in seeds and b0 not in active_defs:
+            if b0 == r0:
+                return None
+            stk.append(b0)
+        while stk:
+            u = stk.pop()
+            if u in seeds or u in active_defs or u in added:
+                continue
+            if len(added) >= max_nodes:
+                return None
+            ddef = de.get_dict_def(u)
+            if ddef is None:
+                return None
+            op, a, b = ddef
+            if a == r0 or b == r0:
+                return None
+            added[u] = (op, a, b)
+            if a not in seeds and a not in active_defs and a not in added:
+                stk.append(a)
+            if b not in seeds and b not in active_defs and b not in added:
+                stk.append(b)
+        return added
+
     for op, a, b, res in ops_list:
         if apply_op(op, a, b, vl) != res:
             return None
@@ -174,8 +207,6 @@ def _sub_dag_new_nodes(
             if ddef is None:
                 return None
             op, a, b = ddef
-            if apply_op(op, a, b, vl) != u:
-                return None
         added[u] = (op, a, b)
         if a not in seeds and a not in active_defs and a not in added:
             stk.append(a)
@@ -556,7 +587,7 @@ def _discover_latent_roots(targets: list[int], vl: int) -> list[int]:
                     x, y = y, x - qt * y
                 for n_c, d_c in ((p1, q1), (p0, q0)):
                     if d_c >= 2 and n_c > d_c:
-                        H = round(A / d_c)
+                        H = (A + (d_c >> 1)) // d_c
                         if H > 100 and d_c * H <= vl and n_c * H <= vl:
                             if abs(A - d_c * H) + abs(B - n_c * H) < max(5000, A // 1000):
                                 roots[H] += max(2, H.bit_length() // 4)
@@ -587,7 +618,7 @@ def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
             if dc < best_edge[v]:
                 best_edge[v] = dc
             if 1 < u < v:
-                q = round(v / u)
+                q = (v + (u >> 1)) // u
                 if q >= 1 and q * u <= de.vl:
                     r = abs(v - q * u)
                     qc = (1 if q > 1 else 0) + (de.lookup_cost(q) if q > 1 else 0)
@@ -598,7 +629,7 @@ def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
                 for d in rat_divs:
                     if u % d == 0 and de.has(d):
                         base = u // d
-                        q = round(v / base)
+                        q = (v + (base >> 1)) // base
                         if 1 <= q <= 64 and q * base <= de.vl:
                             r = abs(v - q * base)
                             rc_q = 0 if q == 1 else (1 + de.lookup_cost(q))
@@ -642,7 +673,10 @@ def _synthesize_best_marginal(
         nonlocal best_added, best_ext
         if not ops_list:
             return
-        lim = 28 if recipe_collector is not None else (len(best_added) if best_added is not None else 1_000_000)
+        if recipe_collector is not None:
+            lim = min(28, len(best_added) + 4) if best_added is not None else 28
+        else:
+            lim = len(best_added) if best_added is not None else 1_000_000
         nd = _sub_dag_new_nodes(ops_list, active_defs, de, max_nodes=lim)
         if nd is None or (v not in nd and v not in active_defs and v not in seeds):
             return
@@ -688,37 +722,53 @@ def _synthesize_best_marginal(
                 if best_added is not None and len(best_added) <= 1 and recipe_collector is None:
                     return best_added
 
-    # 2. 1-op combining active_defs x DictEngine
-    for a in active_sorted:
-        if a < v:
-            b = v - a
-            if de.has(b):
-                consider_ops([("+", a, b, v)])
-            if a > 1 and v % a == 0 and de.has(v // a):
-                consider_ops([("*", a, v // a, v)])
-        elif a > v:
-            b = a - v
-            if de.has(b):
-                consider_ops([("-", a, b, v)])
-            if v > 0 and a % v == 0 and de.has(a // v):
-                consider_ops([("/", a, a // v, v)])
-        if a > 1 and v * a <= vl and de.has(v * a):
-            consider_ops([("/", v * a, a, v)])
+    # 2. 1-op combining active_defs x DictEngine (C99 batched when available)
+    if de.ctx is not None:
+        for op1, a1, b1, r1 in de.find_active_1ops(v, active_sorted):
+            consider_ops([(op1, a1, b1, r1)])
+    else:
+        for a in active_sorted:
+            if a < v:
+                b = v - a
+                if de.has(b):
+                    consider_ops([("+", a, b, v)])
+                if a > 1 and v % a == 0 and de.has(v // a):
+                    consider_ops([("*", a, v // a, v)])
+            elif a > v:
+                b = a - v
+                if de.has(b):
+                    consider_ops([("-", a, b, v)])
+                if v > 0 and a % v == 0 and de.has(a // v):
+                    consider_ops([("/", a, a // v, v)])
+            if a > 1 and v * a <= vl and de.has(v * a):
+                consider_ops([("/", v * a, a, v)])
+
+    if best_added is not None and len(best_added) <= 1:
+        return best_added
 
     # 3. Precomputed smooth-BPE candidates
     if extra_cands:
         for ops in extra_cands:
             consider_ops(ops)
 
-    # 4. Multi-Radix Signed-Digit Horner (incl. powers-of-2 chunked bases 256, 1024, 65536) & NAF
-    if best_added is not None and len(best_added) <= 2 and recipe_collector is None:
+    # 4. Multi-Radix Signed-Digit Horner (cached per DictEngine + allow_univ + depth tier) & NAF
+    if best_added is not None and len(best_added) <= 2:
         return best_added
-    h_bases = (16, 32, 64, 256, 1024, 65536, 10, 12, 100, 8) if depth >= 1 else (16, 256, 65536)
-    for B in h_bases:
-        if B < v and de.has(B):
-            hops = _radix_horner_ops(v, B, de)
-            if hops:
-                consider_ops(hops)
+    h_cache = getattr(de, "_horner_cache", None)
+    h_key = (v, de.univ_ctx is not None, depth >= 1)
+    cached_horner = h_cache.get(h_key) if h_cache is not None else None
+    if cached_horner is None:
+        h_bases = (16, 32, 64, 256, 1024, 65536, 10, 12, 100, 8) if depth >= 1 else (16, 256, 65536)
+        cached_horner = []
+        for B in h_bases:
+            if B < v and de.has(B):
+                hops = _radix_horner_ops(v, B, de)
+                if hops:
+                    cached_horner.append(hops)
+        if h_cache is not None:
+            h_cache[h_key] = cached_horner
+    for hops in cached_horner:
+        consider_ops(hops)
 
     nops = _naf_ops(v, vl, de.powers)
     if nops:
@@ -730,6 +780,7 @@ def _synthesize_best_marginal(
             for sh in (20, 24, 28, 32, 36):
                 if sh not in split_shifts:
                     split_shifts.append(sh)
+        seen_sq: set[int] = set()
         for sh in split_shifts:
             bp = 1 << sh
             if bp not in de.powers or bp <= 1 or bp >= v:
@@ -741,7 +792,8 @@ def _synthesize_best_marginal(
                 sgn = "-"
             else:
                 sgn = "+"
-            if 0 < q * bp <= vl:
+            if 0 < q * bp <= vl and q not in seen_sq:
+                seen_sq.add(q)
                 q_ok = (q == 1 or q in active_set or de.has(q))
                 qo = [] if q_ok else _naf_ops(q, vl, de.powers)
                 if not q_ok and not qo and depth >= 2 and q.bit_length() <= 32:
@@ -767,7 +819,7 @@ def _synthesize_best_marginal(
                         sub.append((sgn, q * bp, r, v))
                     consider_ops(sub)
 
-    if depth <= 0 or (best_added is not None and len(best_added) <= 2 and recipe_collector is None):
+    if depth <= 0 or (best_added is not None and len(best_added) <= 2):
         return best_added
 
     # 5. Active-node * D via C99 full-pool anchor_scan + active rational bridges (a // d) * q +- r
@@ -817,7 +869,7 @@ def _synthesize_best_marginal(
                 base = a // d
                 if base <= 1:
                     continue
-                q = round(v / base)
+                q = (v + (base >> 1)) // base
                 if q <= 0:
                     q = 1
                 prod = base * q
@@ -852,10 +904,10 @@ def _synthesize_best_marginal(
                         + [(sgn, prod, gap, v)]
                     )
 
-    # 6. Scaled 20-bit multiplier split for >= 42-bit targets (top 6 fastest candidates!)
+    # 6. Scaled ~20-bit multiplier split for >= 42-bit targets
     if depth >= 2 and v.bit_length() >= 42 and de.split_muls:
         q_cands = []
-        for m in de.split_muls[:8]:
+        for m in de.split_muls[:4]:
             q, r = divmod(v, m)
             if r > m // 2 and (q + 1) * m <= vl:
                 q += 1

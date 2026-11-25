@@ -98,3 +98,19 @@
   - **Standalone `submissions/kaggle_submission_cell.py` E2E `slice100` (`10%` stratified `data/puzzles.csv`, `--cores 2 --ram-gb 4.0 --verify`):** **`19,956`** instructions in `391.9s` (**`-833` ops / `-4.01%`** vs V8 `20,789`; `Verification PASSED with 0 errors!`).
   - **`python -m pytest tests/ -v`:** **`38 passed in 324.98s`** (`0` failures, `0` skips).
 - **Status:** Ready to run `submissions/kaggle_submission_cell.py` on Kaggle (`4` CPUs, `~31 GB` RAM, `U=240M + D_local=24M / 10M scan`) for the full 1,000-puzzle submission.
+
+## Run 8.1 (Architecture Audit & Pipeline Streamlining)
+- **Full-Pipeline Audit & Fixes Applied:**
+  1. **Bundle Namespace & Kaggle Compatibility (`build_submit.py`, `orchestrator.py`):** AST-verified `0` top-level symbol collisions across all `95` top-level definitions in `14` bundled modules (`277.4 KB` self-contained `submit.py` & `submissions/kaggle_submission_cell.py`), checked `max(value_limit) < 2^60` & `max_seeds = 8` across all `1,000` puzzles, and added explicit error reporting around `init_universal_dict` & `dag_synthesizer` instead of silent `pass`.
+  2. **C99 Safety Guards, `fe_find_active_1ops` & Sorted `fe_two_pointer_s` (`fast_engine.py`):**
+     - Added NULL/empty-scan/hash-load guards in `alloc_bigdict`, `fe_dict_copy_scan`, `fe_dict_copy_scan_prefix`, `fe_two_pointer_s`, and `fe_mitm_probe`; expanded `VB_SEEN_HT` (`32,768 -> 65,536`).
+     - Added C99 `fe_find_active_1ops` + reusable `ctypes` buffers (`_act_buf`), eliminating `4.33M+` Python `de.has()` calls per puzzle (`~4.4s -> <0.05s` wrapper overhead).
+     - Fixed `two_pointer` cache truncation when `K=1/2` precedes `K=16`, sorted `hits_gap` & `hits_sc` deterministically in C99 `fe_two_pointer_s`, replaced `round()` float approximation with exact 60-bit integer nearest division `(v + (d >> 1)) // d`, and auto-versioned the compiled C99 shared library with `zlib.crc32(_C_SOURCE)`.
+     - Fixed named `--ram-gb` profile parsing (`"kaggle_high_ram"`, `"high_ram_16g"`, `"medium_ram"`, `"compact_ram"`, `"low"`), split `DictEngine._caches` by `allow_univ` to prevent cache wipes on toggle, and spaced `split_muls` across `18..24`-bit low-cost multipliers.
+  3. **Synthesizer & Orchestrator De-Duplication (`dag_synthesizer.py`, `orchestrator.py`):**
+     - Added single-op fast path in `_sub_dag_new_nodes` (skipping redundant 3-color cycle DFS and dict-edge re-verification), fixed `1`-op/`2`-op early-exit guards when `recipe_collector` is active, cached `_radix_horner_ops` per `(v, allow_univ, depth >= 1)`, deduplicated `split_shifts` quotients, and guarded redundant `binary_shared` runs when `dag_synthesizer` already beats `55%` of target bits.
+- **Verified Post-Final-Edit Checks:**
+  - **Bundle & AST Verification:** `0` collisions across `95` top-level symbols; `py_compile` passed on `submit.py` & `submissions/kaggle_submission_cell.py` (`277.4 KB`).
+  - **`python -m pytest tests/ -v`:** **`38 passed in 320.80s`** (`0` failures, `0` skips).
+  - **Standalone `submissions/kaggle_submission_cell.py` E2E `slice12` (`scored_0001..0008 + 4 tiny`, `--cores 2 --ram-gb 4.0 --verify`):** **`2,199`** instructions in **`43.5s`** (down `-5.0s` from `48.5s`, `U=8M` ready in `1.2s`, `Verification PASSED with 0 errors!`).
+  - **Direct C99 `kaggle_high_ram` Local-Dict Probe (`24M` cap, `10M` scan, pre-edit C99 kernel baseline):** `fe_local_create` completed in `1.73s` (`scored_0001`, `14.66M` nodes) and `2.12s` (`scored_0002`, `17.48M` nodes, `0.745 GB`).

@@ -2407,10 +2407,24 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
     if isinstance(ram_gb, (int, float)):
         eff_gb = float(ram_gb)
     elif isinstance(ram_gb, str) and ram_gb != "auto":
-        try:
-            eff_gb = float(ram_gb)
-        except ValueError:
-            eff_gb = avail_gb
+        _named_profiles = {
+            "kaggle_high_ram": 25.0,
+            "kaggle": 25.0,
+            "high_ram_16g": 16.0,
+            "high": 16.0,
+            "medium_ram": 8.0,
+            "medium": 8.0,
+            "compact_ram": 4.0,
+            "low": 4.0,
+        }
+        key_ram = ram_gb.strip().lower()
+        if key_ram in _named_profiles:
+            eff_gb = _named_profiles[key_ram]
+        else:
+            try:
+                eff_gb = float(ram_gb)
+            except ValueError:
+                eff_gb = avail_gb
     else:
         eff_gb = max(avail_gb, 25.0) if (on_kaggle and total_gb >= 24.0) else avail_gb
 
@@ -2633,6 +2647,7 @@ static void free_bigdict(BigDict *d) {
 static BigDict* alloc_bigdict(uint32_t cap, uint32_t ht_pow, uint64_t vl) {
     if (cap > 530000000U) cap = 530000000U;
     if (ht_pow < 12U) ht_pow = 12U;
+    while ((1ULL << ht_pow) < (uint64_t)cap * 2ULL && ht_pow < 31U) ht_pow++;
     BigDict *d = (BigDict *)calloc(1, sizeof(BigDict));
     if (!d) return NULL;
     uint64_t ht_size = 1ULL << ht_pow;
@@ -2942,12 +2957,14 @@ EXPORT void fe_dict_get(
 
 EXPORT uint32_t fe_dict_copy_scan(void *p, uint64_t *out) {
     const BigDict *d = (const BigDict *)p;
+    if (!d || !d->scan_vals || d->n_scan == 0) return 0U;
     for (uint32_t i = 0; i < d->n_scan; i++) out[i] = d->scan_vals[i];
     return d->n_scan;
 }
 
 EXPORT uint32_t fe_dict_copy_scan_prefix(void *p, uint64_t *out, uint32_t max_n) {
     const BigDict *d = (const BigDict *)p;
+    if (!d || !d->scan_vals || d->n_scan == 0 || max_n == 0) return 0U;
     uint32_t n = d->n_scan;
     if (n <= max_n) {
         for (uint32_t i = 0; i < n; i++) out[i] = d->scan_vals[i];
@@ -3209,8 +3226,8 @@ EXPORT int fe_two_pointer_s(
 ) {
     const BigDict *d = (const BigDict *)p_local;
     const BigDict *u = (const BigDict *)p_univ;
+    if (!d || !d->scan_vals || d->n_scan == 0 || K <= 0) return 0;
     int N = (int)d->n_scan;
-    if (N == 0) return 0;
     if (K > 64) K = 64;
     if (stride < 1) stride = 1;
 
@@ -3273,6 +3290,26 @@ EXPORT int fe_two_pointer_s(
         if (prod < t128) i += stride;
         else if (prod > t128) j -= stride;
         else break;
+    }
+
+    for (int a_i = 1; a_i < ng; a_i++) {
+        Hit kv = hits_gap[a_i];
+        int b_i = a_i - 1;
+        while (b_i >= 0 && hits_gap[b_i].gap > kv.gap) {
+            hits_gap[b_i + 1] = hits_gap[b_i];
+            b_i--;
+        }
+        hits_gap[b_i + 1] = kv;
+    }
+    for (int a_i = 1; a_i < ns; a_i++) {
+        Hit kv = hits_sc[a_i];
+        int b_i = a_i - 1;
+        while (b_i >= 0 && (hits_sc[b_i].metric > kv.metric ||
+               (hits_sc[b_i].metric == kv.metric && hits_sc[b_i].gap > kv.gap))) {
+            hits_sc[b_i + 1] = hits_sc[b_i];
+            b_i--;
+        }
+        hits_sc[b_i + 1] = kv;
     }
 
     int out = 0;
@@ -3442,6 +3479,7 @@ EXPORT int fe_mitm_probe(
 ) {
     const BigDict *d = (const BigDict *)p_local;
     const BigDict *u = (const BigDict *)p_univ;
+    if (!d || K <= 0 || tgt == 0ULL) return 0;
     if (K > 48) K = 48;
     MitmHit hits[48];
     int nh = 0, wh = 0;
@@ -3512,6 +3550,56 @@ EXPORT int fe_mitm_probe(
     return nh;
 }
 
+/* Batch probe active_defs x (D_local U U) in C99 in a single call to eliminate Python ctypes overhead. */
+EXPORT int fe_find_active_1ops(
+    void *p_local, void *p_univ, uint64_t tgt, uint64_t vl,
+    const uint64_t *act_vals, int n_act, int max_hits,
+    uint8_t *oop, uint64_t *oa, uint64_t *ob
+) {
+    const BigDict *d = (const BigDict *)p_local;
+    const BigDict *u = (const BigDict *)p_univ;
+    if (!d || max_hits <= 0 || tgt == 0ULL || tgt > vl) return 0;
+    int nh = 0;
+    for (int i = 0; i < n_act && nh < max_hits; i++) {
+        uint64_t a = act_vals[i];
+        if (a == 0ULL || a > vl) continue;
+        if (a < tgt) {
+            uint64_t b = tgt - a;
+            if (bd_find(d, b) >= 0 || (u && bd_find(u, b) >= 0)) {
+                oop[nh] = 1; oa[nh] = a; ob[nh] = b; nh++;
+                if (nh >= max_hits) break;
+            }
+            if (a > 1ULL && tgt % a == 0ULL) {
+                uint64_t q = tgt / a;
+                if (bd_find(d, q) >= 0 || (u && bd_find(u, q) >= 0)) {
+                    oop[nh] = 3; oa[nh] = a; ob[nh] = q; nh++;
+                    if (nh >= max_hits) break;
+                }
+            }
+        } else if (a > tgt) {
+            uint64_t b = a - tgt;
+            if (bd_find(d, b) >= 0 || (u && bd_find(u, b) >= 0)) {
+                oop[nh] = 2; oa[nh] = a; ob[nh] = b; nh++;
+                if (nh >= max_hits) break;
+            }
+            if (a % tgt == 0ULL) {
+                uint64_t q = a / tgt;
+                if (bd_find(d, q) >= 0 || (u && bd_find(u, q) >= 0)) {
+                    oop[nh] = 4; oa[nh] = a; ob[nh] = q; nh++;
+                    if (nh >= max_hits) break;
+                }
+            }
+        }
+        if (a > 1ULL && (u128)tgt * (u128)a <= (u128)vl) {
+            uint64_t m = tgt * a;
+            if (bd_find(d, m) >= 0 || (u && bd_find(u, m) >= 0)) {
+                oop[nh] = 4; oa[nh] = m; ob[nh] = a; nh++;
+            }
+        }
+    }
+    return nh;
+}
+
 EXPORT void fe_screen_smooth(
     uint64_t tgt, uint64_t vl, const int32_t *ks, int nk,
     const uint32_t *primes, int np, int32_t *out_sc
@@ -3541,7 +3629,7 @@ EXPORT void fe_screen_smooth(
 
 #define VB_MAX_POOL 96
 #define VB_K_CHILD  32
-#define VB_SEEN_HT  32768U
+#define VB_SEEN_HT  65536U
 #define VB_SET_HT   65536U
 
 typedef struct {
@@ -4019,13 +4107,15 @@ def get_clib() -> Optional[ctypes.CDLL]:
         return None
 
     try:
+        import zlib
+        c_tag = f"v10_{zlib.crc32(_C_SOURCE.encode('utf-8')):08x}"
         ext = ".dll" if os.name == "nt" else ".so"
         tdir = tempfile.gettempdir()
-        so_path = os.path.join(tdir, f"santa2026_fast_engine_v9{ext}")
+        so_path = os.path.join(tdir, f"santa2026_fast_engine_{c_tag}{ext}")
         if not os.path.exists(so_path):
             pid = os.getpid()
-            c_path = os.path.join(tdir, f"santa2026_fast_engine_v9_{pid}.c")
-            tmp_so = os.path.join(tdir, f"santa2026_fast_engine_v9_{pid}{ext}")
+            c_path = os.path.join(tdir, f"santa2026_fast_engine_{c_tag}_{pid}.c")
+            tmp_so = os.path.join(tdir, f"santa2026_fast_engine_{c_tag}_{pid}{ext}")
             with open(c_path, "w", encoding="utf-8") as f:
                 f.write(_C_SOURCE)
             flags = ["gcc", "-O3", "-shared", "-fPIC"] + (["-static-libgcc"] if os.name == "nt" else ["-pthread"])
@@ -4119,6 +4209,14 @@ def get_clib() -> Optional[ctypes.CDLL]:
             ctypes.POINTER(ctypes.c_int),
         ]
         lib.fe_mitm_probe.restype = ctypes.c_int
+
+        lib.fe_find_active_1ops.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        lib.fe_find_active_1ops.restype = ctypes.c_int
 
         lib.fe_screen_smooth.argtypes = [
             ctypes.c_uint64, ctypes.c_uint64,
@@ -4395,11 +4493,18 @@ class DictEngine:
         pb = int(per_bucket if per_bucket is not None else self.profile["per_bucket"])
         scan_cap = min(cap, int(self.profile["local_scan"]))
 
-        self._node_cache: dict[int, Optional[tuple[str, int, int]]] = {}
-        self._has_cache: dict[int, bool] = {}
-        self._cost_cache: dict[int, int] = {}
+        self._caches: dict[bool, tuple[dict[int, Optional[tuple[str, int, int]]], dict[int, bool], dict[int, int]]] = {
+            True: ({}, {}, {}),
+            False: ({}, {}, {}),
+        }
+        self._node_cache, self._has_cache, self._cost_cache = self._caches[True]
         self._tp_cache: dict[tuple[int, bool, bool], list[tuple[int, int, int, int, int]]] = {}
         self._mitm_cache: dict[tuple[int, bool], list[tuple[int, int, int, int, int]]] = {}
+        self._horner_cache: dict[tuple[int, bool, bool], list[list[tuple[str, int, int, int]]]] = {}
+        self._act_buf = (ctypes.c_uint64 * 512)()
+        self._oneop_op = (ctypes.c_uint8 * 64)()
+        self._oneop_a = (ctypes.c_uint64 * 64)()
+        self._oneop_b = (ctypes.c_uint64 * 64)()
         self.ctx = None
         self.univ_ctx = None
         self.c_scan_size = 0
@@ -4423,6 +4528,7 @@ class DictEngine:
 
             if self.ctx:
                 self.univ_ctx = _UNIV_CTX
+                self._node_cache, self._has_cache, self._cost_cache = self._caches[self.univ_ctx is not None]
                 self.c_scan_size = int(self.clib.fe_scan_size(self.ctx))
                 py_ns = min(self.c_scan_size, 200_000)
                 c_arr = (ctypes.c_uint64 * py_ns)()
@@ -4442,7 +4548,14 @@ class DictEngine:
             if self.has(pw):
                 self.powers.add(pw)
             pw *= 2
-        self.split_muls: list[int] = [v for v in self.D_sorted if 16 <= v.bit_length() <= 24][:12]
+        cand_hi = [v for v in self.D_sorted if 18 <= v.bit_length() <= 24]
+        if cand_hi:
+            step = max(1, len(cand_hi) // 24)
+            sampled = cand_hi[::step][:24]
+            sampled.sort(key=lambda v: (self.lookup_cost(v), -v.bit_length(), v))
+            self.split_muls = sampled[:4]
+        else:
+            self.split_muls = [v for v in self.D_sorted if 16 <= v.bit_length() <= 24][:4]
 
     def __enter__(self) -> "DictEngine":
         return self
@@ -4456,14 +4569,12 @@ class DictEngine:
             self.ctx = None
 
     def set_allow_univ(self, allow: bool) -> None:
-        """Toggle visibility of shared `{1}` Universal `U` with zero rebuild cost."""
+        """Toggle visibility of shared `{1}` Universal `U` with zero rebuild or cache-wipe cost."""
         new_u = _UNIV_CTX if (allow and self.ctx is not None) else None
         if new_u == self.univ_ctx:
             return
         self.univ_ctx = new_u
-        self._node_cache.clear()
-        self._has_cache.clear()
-        self._cost_cache.clear()
+        self._node_cache, self._has_cache, self._cost_cache = self._caches[new_u is not None]
         self.powers.clear()
         pw = 1
         while pw <= self.vl:
@@ -4564,29 +4675,78 @@ class DictEngine:
         self._node_cache[v] = res
         return res
 
+    def find_active_1ops(
+        self, tgt: int, active_vals: list[int], max_hits: int = 48
+    ) -> list[tuple[str, int, int, int]]:
+        """Batch-probe active_vals x (D_local U U) in one C99 call without Python loops."""
+        if not active_vals or tgt <= 0 or tgt > self.vl:
+            return []
+        if self.py_backend is not None or self.ctx is None:
+            out: list[tuple[str, int, int, int]] = []
+            vl = self.vl
+            for a in active_vals:
+                if a < tgt:
+                    b = tgt - a
+                    if self.has(b):
+                        out.append(("+", a, b, tgt))
+                    if a > 1 and tgt % a == 0 and self.has(tgt // a):
+                        out.append(("*", a, tgt // a, tgt))
+                elif a > tgt:
+                    b = a - tgt
+                    if self.has(b):
+                        out.append(("-", a, b, tgt))
+                    if a % tgt == 0 and self.has(a // tgt):
+                        out.append(("/", a, a // tgt, tgt))
+                if a > 1 and tgt * a <= vl and self.has(tgt * a):
+                    out.append(("/", tgt * a, a, tgt))
+                if len(out) >= max_hits:
+                    break
+            return out[:max_hits]
+
+        out = []
+        n = len(active_vals)
+        cap = min(max_hits, 64)
+        for off in range(0, n, 512):
+            chunk = active_vals[off : off + 512]
+            na = len(chunk)
+            self._act_buf[:na] = chunk
+            nh = self.clib.fe_find_active_1ops(
+                self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), ctypes.c_uint64(self.vl),
+                self._act_buf, na, cap - len(out),
+                self._oneop_op, self._oneop_a, self._oneop_b,
+            )
+            for i in range(nh):
+                out.append((_OP_MAP[self._oneop_op[i]], self._oneop_a[i], self._oneop_b[i], tgt))
+            if len(out) >= cap:
+                break
+        return out
+
     def two_pointer(
         self, tgt: int, K: int = 16, *, fast: bool = False
     ) -> list[tuple[int, int, int, int, int]]:
         t_key = (tgt, self.univ_ctx is not None, fast)
-        if t_key in self._tp_cache:
-            return self._tp_cache[t_key]
+        cached = self._tp_cache.get(t_key)
+        if cached is not None and (len(cached) >= K or K <= 16):
+            return cached[:K]
         if self.py_backend is not None:
-            res = self.py_backend.two_pointer(tgt, K=K)
+            K_q = max(K, 16)
+            res = self.py_backend.two_pointer(tgt, K=K_q)
             self._tp_cache[t_key] = res
-            return res
+            return res[:K]
+        K_q = max(K, 16)
         stride = max(1, self.c_scan_size // 500_000) if fast else 1
-        od1 = (ctypes.c_uint64 * K)()
-        od2 = (ctypes.c_uint64 * K)()
-        oprod = (ctypes.c_uint64 * K)()
-        ogap = (ctypes.c_uint64 * K)()
-        osgn = (ctypes.c_int * K)()
+        od1 = (ctypes.c_uint64 * K_q)()
+        od2 = (ctypes.c_uint64 * K_q)()
+        oprod = (ctypes.c_uint64 * K_q)()
+        ogap = (ctypes.c_uint64 * K_q)()
+        osgn = (ctypes.c_int * K_q)()
         nh = self.clib.fe_two_pointer_s(
-            self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), K, stride,
+            self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), K_q, stride,
             od1, od2, oprod, ogap, osgn
         )
         res = [(od1[i], od2[i], oprod[i], ogap[i], osgn[i]) for i in range(nh)]
         self._tp_cache[t_key] = res
-        return res
+        return res[:K]
 
     def anchor_scan(
         self, tgt: int, active_vals: list[int], K: int = 16
@@ -4627,7 +4787,7 @@ class DictEngine:
             return hits[:K]
 
         na = min(len(active_vals), 512)
-        act_arr = (ctypes.c_uint64 * na)(*active_vals[-na:])
+        self._act_buf[:na] = active_vals[-na:]
         oa = (ctypes.c_uint64 * K)()
         oq = (ctypes.c_uint64 * K)()
         oprod = (ctypes.c_uint64 * K)()
@@ -4636,7 +4796,7 @@ class DictEngine:
         osc = (ctypes.c_int * K)()
         nh = self.clib.fe_anchor_scan(
             self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), ctypes.c_uint64(self.vl),
-            act_arr, na, K, oa, oq, oprod, ogap, osgn, osc
+            self._act_buf, na, K, oa, oq, oprod, ogap, osgn, osc
         )
         res = [(osc[i], ogap[i], oa[i], oq[i], oprod[i], osgn[i]) for i in range(nh)]
         res.sort(key=lambda x: (x[0], x[1]))
@@ -4672,7 +4832,7 @@ class DictEngine:
 
         na = min(len(active_vals), 256)
         if na > 0:
-            act_arr = (ctypes.c_uint64 * na)(*active_vals[-na:])
+            self._act_buf[:na] = active_vals[-na:]
             Ka = min(8, K)
             oa = (ctypes.c_uint64 * Ka)()
             oq = (ctypes.c_uint64 * Ka)()
@@ -4681,7 +4841,7 @@ class DictEngine:
             osc = (ctypes.c_int * Ka)()
             nh_a = self.clib.fe_mitm_probe(
                 self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), ctypes.c_uint64(self.vl),
-                act_arr, na, ctypes.c_uint32(0), Ka, oa, oq, or_, osgn, osc
+                self._act_buf, na, ctypes.c_uint32(0), Ka, oa, oq, or_, osgn, osc
             )
             act_hits = [(oa[i], oq[i], or_[i], osgn[i], osc[i]) for i in range(nh_a)]
             combined = act_hits + static_hits
@@ -4920,6 +5080,39 @@ def _sub_dag_new_nodes(
     local_edges: dict[int, tuple[str, int, int]] = {}
     vl = de.vl
     seeds = de.seeds_set
+    if len(ops_list) == 1:
+        op0, a0, b0, r0 = ops_list[0]
+        if apply_op(op0, a0, b0, vl) != r0:
+            return None
+        added[r0] = (op0, a0, b0)
+        stk = []
+        if a0 not in seeds and a0 not in active_defs:
+            if a0 == r0:
+                return None
+            stk.append(a0)
+        if b0 not in seeds and b0 not in active_defs:
+            if b0 == r0:
+                return None
+            stk.append(b0)
+        while stk:
+            u = stk.pop()
+            if u in seeds or u in active_defs or u in added:
+                continue
+            if len(added) >= max_nodes:
+                return None
+            ddef = de.get_dict_def(u)
+            if ddef is None:
+                return None
+            op, a, b = ddef
+            if a == r0 or b == r0:
+                return None
+            added[u] = (op, a, b)
+            if a not in seeds and a not in active_defs and a not in added:
+                stk.append(a)
+            if b not in seeds and b not in active_defs and b not in added:
+                stk.append(b)
+        return added
+
     for op, a, b, res in ops_list:
         if apply_op(op, a, b, vl) != res:
             return None
@@ -4945,8 +5138,6 @@ def _sub_dag_new_nodes(
             if ddef is None:
                 return None
             op, a, b = ddef
-            if apply_op(op, a, b, vl) != u:
-                return None
         added[u] = (op, a, b)
         if a not in seeds and a not in active_defs and a not in added:
             stk.append(a)
@@ -5327,7 +5518,7 @@ def _discover_latent_roots(targets: list[int], vl: int) -> list[int]:
                     x, y = y, x - qt * y
                 for n_c, d_c in ((p1, q1), (p0, q0)):
                     if d_c >= 2 and n_c > d_c:
-                        H = round(A / d_c)
+                        H = (A + (d_c >> 1)) // d_c
                         if H > 100 and d_c * H <= vl and n_c * H <= vl:
                             if abs(A - d_c * H) + abs(B - n_c * H) < max(5000, A // 1000):
                                 roots[H] += max(2, H.bit_length() // 4)
@@ -5358,7 +5549,7 @@ def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
             if dc < best_edge[v]:
                 best_edge[v] = dc
             if 1 < u < v:
-                q = round(v / u)
+                q = (v + (u >> 1)) // u
                 if q >= 1 and q * u <= de.vl:
                     r = abs(v - q * u)
                     qc = (1 if q > 1 else 0) + (de.lookup_cost(q) if q > 1 else 0)
@@ -5369,7 +5560,7 @@ def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
                 for d in rat_divs:
                     if u % d == 0 and de.has(d):
                         base = u // d
-                        q = round(v / base)
+                        q = (v + (base >> 1)) // base
                         if 1 <= q <= 64 and q * base <= de.vl:
                             r = abs(v - q * base)
                             rc_q = 0 if q == 1 else (1 + de.lookup_cost(q))
@@ -5413,7 +5604,10 @@ def _synthesize_best_marginal(
         nonlocal best_added, best_ext
         if not ops_list:
             return
-        lim = 28 if recipe_collector is not None else (len(best_added) if best_added is not None else 1_000_000)
+        if recipe_collector is not None:
+            lim = min(28, len(best_added) + 4) if best_added is not None else 28
+        else:
+            lim = len(best_added) if best_added is not None else 1_000_000
         nd = _sub_dag_new_nodes(ops_list, active_defs, de, max_nodes=lim)
         if nd is None or (v not in nd and v not in active_defs and v not in seeds):
             return
@@ -5459,37 +5653,53 @@ def _synthesize_best_marginal(
                 if best_added is not None and len(best_added) <= 1 and recipe_collector is None:
                     return best_added
 
-    # 2. 1-op combining active_defs x DictEngine
-    for a in active_sorted:
-        if a < v:
-            b = v - a
-            if de.has(b):
-                consider_ops([("+", a, b, v)])
-            if a > 1 and v % a == 0 and de.has(v // a):
-                consider_ops([("*", a, v // a, v)])
-        elif a > v:
-            b = a - v
-            if de.has(b):
-                consider_ops([("-", a, b, v)])
-            if v > 0 and a % v == 0 and de.has(a // v):
-                consider_ops([("/", a, a // v, v)])
-        if a > 1 and v * a <= vl and de.has(v * a):
-            consider_ops([("/", v * a, a, v)])
+    # 2. 1-op combining active_defs x DictEngine (C99 batched when available)
+    if de.ctx is not None:
+        for op1, a1, b1, r1 in de.find_active_1ops(v, active_sorted):
+            consider_ops([(op1, a1, b1, r1)])
+    else:
+        for a in active_sorted:
+            if a < v:
+                b = v - a
+                if de.has(b):
+                    consider_ops([("+", a, b, v)])
+                if a > 1 and v % a == 0 and de.has(v // a):
+                    consider_ops([("*", a, v // a, v)])
+            elif a > v:
+                b = a - v
+                if de.has(b):
+                    consider_ops([("-", a, b, v)])
+                if v > 0 and a % v == 0 and de.has(a // v):
+                    consider_ops([("/", a, a // v, v)])
+            if a > 1 and v * a <= vl and de.has(v * a):
+                consider_ops([("/", v * a, a, v)])
+
+    if best_added is not None and len(best_added) <= 1:
+        return best_added
 
     # 3. Precomputed smooth-BPE candidates
     if extra_cands:
         for ops in extra_cands:
             consider_ops(ops)
 
-    # 4. Multi-Radix Signed-Digit Horner (incl. powers-of-2 chunked bases 256, 1024, 65536) & NAF
-    if best_added is not None and len(best_added) <= 2 and recipe_collector is None:
+    # 4. Multi-Radix Signed-Digit Horner (cached per DictEngine + allow_univ + depth tier) & NAF
+    if best_added is not None and len(best_added) <= 2:
         return best_added
-    h_bases = (16, 32, 64, 256, 1024, 65536, 10, 12, 100, 8) if depth >= 1 else (16, 256, 65536)
-    for B in h_bases:
-        if B < v and de.has(B):
-            hops = _radix_horner_ops(v, B, de)
-            if hops:
-                consider_ops(hops)
+    h_cache = getattr(de, "_horner_cache", None)
+    h_key = (v, de.univ_ctx is not None, depth >= 1)
+    cached_horner = h_cache.get(h_key) if h_cache is not None else None
+    if cached_horner is None:
+        h_bases = (16, 32, 64, 256, 1024, 65536, 10, 12, 100, 8) if depth >= 1 else (16, 256, 65536)
+        cached_horner = []
+        for B in h_bases:
+            if B < v and de.has(B):
+                hops = _radix_horner_ops(v, B, de)
+                if hops:
+                    cached_horner.append(hops)
+        if h_cache is not None:
+            h_cache[h_key] = cached_horner
+    for hops in cached_horner:
+        consider_ops(hops)
 
     nops = _naf_ops(v, vl, de.powers)
     if nops:
@@ -5501,6 +5711,7 @@ def _synthesize_best_marginal(
             for sh in (20, 24, 28, 32, 36):
                 if sh not in split_shifts:
                     split_shifts.append(sh)
+        seen_sq: set[int] = set()
         for sh in split_shifts:
             bp = 1 << sh
             if bp not in de.powers or bp <= 1 or bp >= v:
@@ -5512,7 +5723,8 @@ def _synthesize_best_marginal(
                 sgn = "-"
             else:
                 sgn = "+"
-            if 0 < q * bp <= vl:
+            if 0 < q * bp <= vl and q not in seen_sq:
+                seen_sq.add(q)
                 q_ok = (q == 1 or q in active_set or de.has(q))
                 qo = [] if q_ok else _naf_ops(q, vl, de.powers)
                 if not q_ok and not qo and depth >= 2 and q.bit_length() <= 32:
@@ -5538,7 +5750,7 @@ def _synthesize_best_marginal(
                         sub.append((sgn, q * bp, r, v))
                     consider_ops(sub)
 
-    if depth <= 0 or (best_added is not None and len(best_added) <= 2 and recipe_collector is None):
+    if depth <= 0 or (best_added is not None and len(best_added) <= 2):
         return best_added
 
     # 5. Active-node * D via C99 full-pool anchor_scan + active rational bridges (a // d) * q +- r
@@ -5588,7 +5800,7 @@ def _synthesize_best_marginal(
                 base = a // d
                 if base <= 1:
                     continue
-                q = round(v / base)
+                q = (v + (base >> 1)) // base
                 if q <= 0:
                     q = 1
                 prod = base * q
@@ -5623,10 +5835,10 @@ def _synthesize_best_marginal(
                         + [(sgn, prod, gap, v)]
                     )
 
-    # 6. Scaled 20-bit multiplier split for >= 42-bit targets (top 6 fastest candidates!)
+    # 6. Scaled ~20-bit multiplier split for >= 42-bit targets
     if depth >= 2 and v.bit_length() >= 42 and de.split_muls:
         q_cands = []
-        for m in de.split_muls[:8]:
+        for m in de.split_muls[:4]:
             q, r = divmod(v, m)
             if r > m // 2 and (q + 1) * m <= vl:
                 q += 1
@@ -6737,8 +6949,9 @@ def solve_puzzle(
             r = verify_program(puzzle, prog)
             if r.valid:
                 candidates.append(prog)
-        except Exception:
-            pass
+        except Exception as e:
+            if verbose:
+                print(f"  [warn] dag_synthesizer failed on {puzzle.id}: {e!r}", flush=True)
 
     # --- C99 2-step Value-Set Beam Search (joint intermediate sharing for small/medium ranges) ---
     if 40 <= puzzle.value_limit and puzzle.targets and max(puzzle.targets) <= 25_000_000 and len(puzzle.targets) <= 15:
@@ -6752,14 +6965,16 @@ def solve_puzzle(
         except Exception:
             pass
 
-    # --- binary_shared (secondary wNAF ensemble — fast baseline) ---
-    try:
-        prog = binary_shared.solve(puzzle)
-        r = verify_program(puzzle, prog)
-        if r.valid:
-            candidates.append(prog)
-    except Exception:
-        pass
+    # --- binary_shared (secondary wNAF safety net — skip when DAG already beats 55% bit-budget) ---
+    bit_thresh = max(40, (sum(t.bit_length() for t in puzzle.targets) * 55) // 100)
+    if not candidates or min(len(c) for c in candidates) > bit_thresh:
+        try:
+            prog = binary_shared.solve(puzzle)
+            r = verify_program(puzzle, prog)
+            if r.valid:
+                candidates.append(prog)
+        except Exception:
+            pass
 
     # --- Specialised small-range solvers (fast path for < 10^7 targets) ---
     if max(puzzle.targets) < 10**7 and label != PuzzleClass.TINY:
@@ -6878,8 +7093,9 @@ def run(
                     f"(Avail {t1_mem['avail_gb']:.2f} GB, Proc RSS {t1_mem['proc_rss_gb']:.2f} GB)",
                     flush=True,
                 )
-    except Exception:
-        pass
+    except Exception as e:
+        if verbose:
+            print(f"Warning: C99 universal dict init failed ({e!r}); falling back to Python.", flush=True)
 
     if verbose:
         print(f"Loaded {len(puzzles)} puzzles. Solving with {cores} core(s) [{backend_name}]...", flush=True)
