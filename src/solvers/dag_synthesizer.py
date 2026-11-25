@@ -20,6 +20,7 @@ Optimization stages:
 from __future__ import annotations
 import bisect
 import math
+import time
 from collections import Counter, defaultdict
 from typing import Optional
 
@@ -90,7 +91,7 @@ def _pollard_rho(n: int) -> int:
     return n
 
 
-def _factor_hybrid(n: int, rho_limit: int = 10**9) -> tuple[list[int], int]:
+def _factor_hybrid(n: int, rho_limit: int = 10**11) -> tuple[list[int], int]:
     """
     Factor `n` using primes <= 2000 plus bounded Pollard's Rho up to `rho_limit`.
     Returns (list_of_small_or_medium_factors, remaining_unfactored).
@@ -98,7 +99,7 @@ def _factor_hybrid(n: int, rho_limit: int = 10**9) -> tuple[list[int], int]:
     facs: list[int] = []
     for p in _SMALL_PRIMES:
         if p * p > n:
-            if 1 < n <= 50000:
+            if 1 < n <= (1 << 25):
                 facs.append(n)
                 n = 1
             break
@@ -113,8 +114,8 @@ def _factor_hybrid(n: int, rho_limit: int = 10**9) -> tuple[list[int], int]:
             m = stk.pop()
             if m <= 1:
                 continue
-            if m <= 50000 or _is_prime(m):
-                if m <= 50000:
+            if m <= (1 << 24) or _is_prime(m):
+                if m <= (1 << 24):
                     facs.append(m)
                 else:
                     rem_out *= m
@@ -137,30 +138,35 @@ def _sub_dag_new_nodes(
     ops_list: list[tuple[str, int, int, int]],
     active_defs: dict[int, tuple[str, int, int]],
     de: DictEngine,
+    *,
+    max_nodes: int = 1_000_000,
 ) -> Optional[dict[int, tuple[str, int, int]]]:
     """
     Resolve missing ancestors from `de` (dictionary) beyond `active_defs`.
-    Returns `{v: (op, a, b)}` of newly required nodes, or None if invalid/cyclic.
+    Returns `{v: (op, a, b)}` of newly required nodes, or None if invalid/cyclic/over limit.
     """
     added: dict[int, tuple[str, int, int]] = {}
     local_edges: dict[int, tuple[str, int, int]] = {}
     vl = de.vl
+    seeds = de.seeds_set
     for op, a, b, res in ops_list:
         if apply_op(op, a, b, vl) != res:
             return None
         local_edges[res] = (op, a, b)
 
-    seeds = de.seeds_set
-    seen = seeds | set(active_defs.keys())
     stk = [res for (_, _, _, res) in ops_list]
     for _, a, b, _ in ops_list:
-        stk.append(a)
-        stk.append(b)
+        if a not in seeds and a not in active_defs:
+            stk.append(a)
+        if b not in seeds and b not in active_defs:
+            stk.append(b)
 
     while stk:
         u = stk.pop()
-        if u in seen or u in added:
+        if u in seeds or u in active_defs or u in added:
             continue
+        if len(added) >= max_nodes:
+            return None
         if u in local_edges:
             op, a, b = local_edges[u]
         else:
@@ -171,9 +177,9 @@ def _sub_dag_new_nodes(
             if apply_op(op, a, b, vl) != u:
                 return None
         added[u] = (op, a, b)
-        if a not in seen and a not in added:
+        if a not in seeds and a not in active_defs and a not in added:
             stk.append(a)
-        if b not in seen and b not in added:
+        if b not in seeds and b not in active_defs and b not in added:
             stk.append(b)
 
     # Strict cycle check within `added`
@@ -306,8 +312,15 @@ def _precompute_smooth_bpe(
             raw_k.extend([s, -s])
 
     target_cands: dict[int, list[tuple[int, int, Counter[int], list[tuple[str, int, int, int]]]]] = defaultdict(list)
+    must_k = [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5] + [
+        kv for s in de.seeds for kv in (s, -s) if s > off_lim
+    ]
     for t in targets:
-        k_short = de.screen_smooth_offsets(t, raw_k, _SMALL_PRIMES, top_m=18)
+        screened = de.screen_smooth_offsets(t, raw_k, _SMALL_PRIMES, top_m=18)
+        k_short = list(must_k)
+        for kv in screened:
+            if kv not in must_k:
+                k_short.append(kv)
         cands = []
         seen_k = set()
         for k in k_short:
@@ -327,7 +340,14 @@ def _precompute_smooth_bpe(
             else:
                 dc = de.lookup_cost(rem)
                 rem_c = dc if dc < 99 else (rem.bit_length() // 3 + 3)
-            sc = len(facs) + rem_c + (0 if k == 0 else 1)
+            fac_c = 0
+            for fp in facs:
+                if fp <= 2000 or fp in de.seeds_set:
+                    fac_c += 1
+                else:
+                    dfc = de.lookup_cost(fp)
+                    fac_c += dfc if dfc < 99 else (fp.bit_length() // 3 + 3)
+            sc = fac_c + rem_c + (0 if k == 0 else 1)
             cands.append((sc, k, cand, facs, rem))
         if not cands:
             continue
@@ -339,11 +359,25 @@ def _precompute_smooth_bpe(
             ok = True
             for p, e in counts.items():
                 if not de.has(p) and p not in de.seeds_set:
-                    np = _naf_ops(p, vl, de.powers)
-                    if not np:
-                        ok = False
-                        break
-                    ops.extend(np)
+                    tp_p = de.two_pointer(p, K=3, fast=True) if p.bit_length() >= 14 else []
+                    got_p = False
+                    for d1p, d2p, pp, gp, sgp in tp_p:
+                        if gp == 0:
+                            ops.append(("*", d1p, d2p, pp))
+                            got_p = True
+                            break
+                        if gp in de.seeds_set or de.has(gp):
+                            if not de.has(pp):
+                                ops.append(("*", d1p, d2p, pp))
+                            ops.append(("+" if sgp == 1 else "-", pp, gp, p))
+                            got_p = True
+                            break
+                    if not got_p:
+                        np = _naf_ops(p, vl, de.powers)
+                        if not np:
+                            ok = False
+                            break
+                        ops.extend(np)
                 pe = p ** e
                 if pe > vl:
                     ok = False
@@ -380,7 +414,7 @@ def _precompute_smooth_bpe(
                 continue
             if rem > 1:
                 if not de.has(rem) and rem not in de.seeds_set:
-                    tp = de.two_pointer(rem, K=4)
+                    tp = de.two_pointer(rem, K=4, fast=True)
                     added_rem = False
                     for d1, d2, prod, gap, sgn in tp:
                         if gap == 0 or de.has(gap):
@@ -486,8 +520,9 @@ def _precompute_smooth_bpe(
 
 def _discover_latent_roots(targets: list[int], vl: int) -> list[int]:
     """
-    Discover hidden roots H where pairs satisfy A ≈ d*H, B ≈ n*H (2 <= d <= 32)
-    OR share nontrivial pairwise GCDs `gcd(A +- k1, B +- k2) > 100`.
+    Discover high-leverage shared roots H across ALL target pairs:
+      1. Common nontrivial GCDs `gcd(A +- k1, B +- k2) > 100` (weighted by bit-savings).
+      2. Gauss/CF rational multiples A ≈ d*H, B ≈ n*H (1 <= d, n <= 24).
     """
     roots: Counter[int] = Counter()
     ts = sorted(targets)
@@ -495,33 +530,43 @@ def _discover_latent_roots(targets: list[int], vl: int) -> list[int]:
     for i, A in enumerate(ts):
         if A <= 200:
             continue
-        for B in ts[i + 1 : min(n_t, i + 12)]:
+        for B in ts[i + 1 : n_t]:
             g0 = math.gcd(A, B)
             if 100 < g0 < A:
-                roots[g0] += 4
+                roots[g0] += max(4, g0.bit_length())
             for off_a in (-1, 0, 1):
                 for off_b in (-1, 0, 1):
                     if off_a == 0 and off_b == 0:
                         continue
                     ga = math.gcd(A + off_a, B + off_b)
                     if 100 < ga < A:
-                        roots[ga] += 2
-            for d in range(2, 33):
-                n = round(B * d / A)
-                if n <= d or math.gcd(n, d) != 1:
-                    continue
-                H = round(A / d)
-                if H <= 100 or d * H > vl or n * H > vl:
-                    continue
-                if abs(A - d * H) + abs(B - n * H) < max(2000, A // 2000):
-                    roots[H] += 1
-    return [h for h, _ in roots.most_common(10)]
+                        roots[ga] += max(2, ga.bit_length() // 2)
+            if B > A:
+                # Quick continued-fraction convergent check for n*A ≈ d*B
+                x, y = B, A
+                p0, p1 = 0, 1
+                q0, q1 = 1, 0
+                while y > 0:
+                    qt = x // y
+                    p2, q2 = qt * p1 + p0, qt * q1 + q0
+                    if q2 > 24:
+                        break
+                    p0, p1 = p1, p2
+                    q0, q1 = q1, q2
+                    x, y = y, x - qt * y
+                for n_c, d_c in ((p1, q1), (p0, q0)):
+                    if d_c >= 2 and n_c > d_c:
+                        H = round(A / d_c)
+                        if H > 100 and d_c * H <= vl and n_c * H <= vl:
+                            if abs(A - d_c * H) + abs(B - n_c * H) < max(5000, A // 1000):
+                                roots[H] += max(2, H.bit_length() // 4)
+    return [h for h, _ in roots.most_common(6)]
 
 
 def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
     """
     Minimum Spanning Arborescence over targets scored by exact pair-bridge costs:
-    |t_v - t_u| or t_v = q * t_u +- r, chained cleanly so related targets build adjacent.
+    |v - u|, q*u +- r, and rational (u // d)*q +- r, chaining related targets together.
     """
     if len(targets) <= 2:
         return sorted(targets, key=lambda x: (x.bit_length(), x))
@@ -533,15 +578,14 @@ def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
     for v in unvis:
         best_edge[v] = de.lookup_cost(v) if de.has(v) else (v.bit_length() // 3 + 3)
 
+    rat_divs = (2, 3, 4, 5, 6, 8, 9, 10, 12, 16)
     while unvis:
         u = order[-1]
         for v in unvis:
-            # 1. Additive delta |v - u|
             diff = abs(v - u)
             dc = (1 + de.lookup_cost(diff)) if diff > 0 else 0
             if dc < best_edge[v]:
                 best_edge[v] = dc
-            # 2. Quotient q*u +- r (when u < v)
             if 1 < u < v:
                 q = round(v / u)
                 if q >= 1 and q * u <= de.vl:
@@ -550,6 +594,18 @@ def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
                     rc = 0 if r == 0 else (1 + de.lookup_cost(r))
                     if qc + rc < best_edge[v]:
                         best_edge[v] = qc + rc
+            if u > 4:
+                for d in rat_divs:
+                    if u % d == 0 and de.has(d):
+                        base = u // d
+                        q = round(v / base)
+                        if 1 <= q <= 64 and q * base <= de.vl:
+                            r = abs(v - q * base)
+                            rc_q = 0 if q == 1 else (1 + de.lookup_cost(q))
+                            rc_r = 0 if r == 0 else (1 + de.lookup_cost(r))
+                            c_rat = 1 + de.lookup_cost(d) + rc_q + rc_r
+                            if c_rat < best_edge[v]:
+                                best_edge[v] = c_rat
         nxt = min(unvis, key=lambda v: (best_edge[v], v.bit_length(), v))
         order.append(nxt)
         unvis.remove(nxt)
@@ -580,18 +636,27 @@ def _synthesize_best_marginal(
         return {}
 
     best_added: Optional[dict[int, tuple[str, int, int]]] = None
+    best_ext: int = 10**9
 
     def consider_ops(ops_list: Optional[list[tuple[str, int, int, int]]]) -> None:
-        nonlocal best_added
+        nonlocal best_added, best_ext
         if not ops_list:
             return
-        nd = _sub_dag_new_nodes(ops_list, active_defs, de)
+        lim = 28 if recipe_collector is not None else (len(best_added) if best_added is not None else 1_000_000)
+        nd = _sub_dag_new_nodes(ops_list, active_defs, de, max_nodes=lim)
         if nd is None or (v not in nd and v not in active_defs and v not in seeds):
             return
-        if recipe_collector is not None and len(nd) <= 28:
+        n_nd = len(nd)
+        if recipe_collector is not None and n_nd <= 28:
             recipe_collector.append(nd)
-        if best_added is None or len(nd) < len(best_added):
+        if best_added is None or n_nd < len(best_added):
             best_added = nd
+            best_ext = sum(1 for _, (_, ax, bx) in nd.items() for x in (ax, bx) if x in active_defs)
+        elif n_nd == len(best_added):
+            ext = sum(1 for _, (_, ax, bx) in nd.items() for x in (ax, bx) if x in active_defs)
+            if ext < best_ext:
+                best_added = nd
+                best_ext = ext
 
     # 0. Direct dictionary lookup
     if de.has(v):
@@ -646,7 +711,10 @@ def _synthesize_best_marginal(
             consider_ops(ops)
 
     # 4. Multi-Radix Signed-Digit Horner (incl. powers-of-2 chunked bases 256, 1024, 65536) & NAF
-    for B in (16, 32, 64, 256, 1024, 65536, 10, 12, 100, 8):
+    if best_added is not None and len(best_added) <= 2 and recipe_collector is None:
+        return best_added
+    h_bases = (16, 32, 64, 256, 1024, 65536, 10, 12, 100, 8) if depth >= 1 else (16, 256, 65536)
+    for B in h_bases:
         if B < v and de.has(B):
             hops = _radix_horner_ops(v, B, de)
             if hops:
@@ -677,7 +745,7 @@ def _synthesize_best_marginal(
                 q_ok = (q == 1 or q in active_set or de.has(q))
                 qo = [] if q_ok else _naf_ops(q, vl, de.powers)
                 if not q_ok and not qo and depth >= 2 and q.bit_length() <= 32:
-                    tp_q = de.two_pointer(q, K=1)
+                    tp_q = de.two_pointer(q, K=1, fast=True)
                     if tp_q:
                         d1q, d2q, pq, gq, sgq = tp_q[0]
                         if gq == 0:
@@ -702,59 +770,87 @@ def _synthesize_best_marginal(
     if depth <= 0 or (best_added is not None and len(best_added) <= 2 and recipe_collector is None):
         return best_added
 
-    # 5. Active-node * D binary search (anchors cost 0!)
-    D_s = de.D_sorted
-    nD = len(D_s)
-    anchor_proposals = []
-    cand_anchors = [a for a in active_sorted if 1 < a < v and a not in de.powers]
-    if len(cand_anchors) > 25:
-        cand_anchors = cand_anchors[-25:]
-    for a in cand_anchors:
-        q_int = v // a
-        for qq in (q_int, q_int + 1):
-            if qq >= 1 and qq * a <= vl and (qq == 1 or de.has(qq) or qq <= 128):
-                prod = qq * a
-                anchor_proposals.append((abs(v - prod), a, qq, prod, "+" if v >= prod else "-"))
-        pos = bisect.bisect_left(D_s, q_int)
-        for off in (-1, 0, 1):
-            if 0 <= pos + off < nD:
-                qq = D_s[pos + off]
-                prod = a * qq
-                if 0 < prod <= vl:
-                    anchor_proposals.append((abs(v - prod), a, qq, prod, "+" if v >= prod else "-"))
-
-    anchor_proposals.sort(key=lambda x: x[0])
-    seen_prods: set[int] = set()
-    tried_ap = 0
-    for gap, a, qq, prod, sgn in anchor_proposals:
-        if prod in seen_prods:
-            continue
-        seen_prods.add(prod)
-        tried_ap += 1
-        if tried_ap > 4:
-            break
-        if qq == 1:
-            sub = []
-        elif de.has(qq):
-            sub = [("*", a, qq, prod)]
-        else:
-            qops = _naf_ops(qq, vl, de.powers)
-            if not qops:
+    # 5. Active-node * D via C99 full-pool anchor_scan + active rational bridges (a // d) * q +- r
+    if depth >= 2 or v.bit_length() >= 24:
+        anc_hits = de.anchor_scan(v, active_sorted, K=18)
+        seen_prods: set[int] = set()
+        tried_ap = 0
+        for _, gap, a, qq, prod, sgn_int in anc_hits:
+            if prod in seen_prods:
                 continue
-            sub = qops + [("*", a, qq, prod)]
-        if gap == 0:
-            consider_ops(sub)
-        elif gap in active_set or de.has(gap):
-            consider_ops(sub + [(sgn, prod, gap, v)])
-        elif depth >= 2:
-            res_depth = 1 if tried_ap <= 2 else 0
-            g_added = _synthesize_best_marginal(gap, active_defs, active_sorted, de, depth=res_depth)
-            if g_added is not None:
-                consider_ops(
-                    list(sub)
-                    + [(op, ax, bx, rx) for rx, (op, ax, bx) in g_added.items()]
-                    + [(sgn, prod, gap, v)]
-                )
+            seen_prods.add(prod)
+            tried_ap += 1
+            if tried_ap > 5:
+                break
+            sgn = "+" if sgn_int == 1 else "-"
+            if qq == 1:
+                sub = []
+            elif de.has(qq) or qq in active_set:
+                sub = [("*", a, qq, prod)] if prod not in active_set else []
+            else:
+                qops = _naf_ops(qq, vl, de.powers)
+                if not qops:
+                    continue
+                sub = qops + [("*", a, qq, prod)]
+            if gap == 0:
+                consider_ops(sub)
+            elif gap in active_set or de.has(gap):
+                consider_ops(sub + [(sgn, prod, gap, v)])
+            elif depth >= 2:
+                res_depth = 1 if tried_ap <= 2 else 0
+                g_added = _synthesize_best_marginal(gap, active_defs, active_sorted, de, depth=res_depth)
+                if g_added is not None:
+                    consider_ops(
+                        list(sub)
+                        + [(op, ax, bx, rx) for rx, (op, ax, bx) in g_added.items()]
+                        + [(sgn, prod, gap, v)]
+                    )
+
+    # 5b. Active-target rational bridges: v ≈ (a // d) * q +- r (top-level depth >= 2)
+    if depth >= 2 and v > 100 and active_sorted:
+        rat_cands: list[tuple[int, int, int, int, int, int, str]] = []
+        act_big = [a for a in active_sorted if a > 100 and a not in de.powers][-48:]
+        for a in act_big:
+            for d in (2, 3, 4, 5, 6, 8, 10, 12):
+                if a % d != 0 or not (d in active_set or de.has(d)):
+                    continue
+                base = a // d
+                if base <= 1:
+                    continue
+                q = round(v / base)
+                if q <= 0:
+                    q = 1
+                prod = base * q
+                if prod <= 0 or prod > vl:
+                    continue
+                if q == 1 or q <= 64 or q in active_set or de.has(q):
+                    gap = abs(v - prod)
+                    est = (0 if gap == 0 else gap.bit_length() // 3 + 3) + (0 if q == 1 else 2)
+                    rat_cands.append((est, gap, a, d, base, q, "+" if v >= prod else "-"))
+        rat_cands.sort(key=lambda x: (x[0], x[1]))
+        for _, gap, a, d, base, q, sgn in rat_cands[:3]:
+            sub_r: list[tuple[str, int, int, int]] = [] if base in active_set else [("/", a, d, base)]
+            prod = base * q
+            if q > 1:
+                if q not in active_set and not de.has(q):
+                    qops = _naf_ops(q, vl, de.powers)
+                    if not qops:
+                        continue
+                    sub_r.extend(qops)
+                if prod not in active_set:
+                    sub_r.append(("*", base, q, prod))
+            if gap == 0:
+                consider_ops(sub_r)
+            elif gap in active_set or de.has(gap):
+                consider_ops(sub_r + [(sgn, prod, gap, v)])
+            else:
+                g_added = _synthesize_best_marginal(gap, active_defs, active_sorted, de, depth=1)
+                if g_added is not None:
+                    consider_ops(
+                        list(sub_r)
+                        + [(op, ax, bx, rx) for rx, (op, ax, bx) in g_added.items()]
+                        + [(sgn, prod, gap, v)]
+                    )
 
     # 6. Scaled 20-bit multiplier split for >= 42-bit targets (top 6 fastest candidates!)
     if depth >= 2 and v.bit_length() >= 42 and de.split_muls:
@@ -768,7 +864,7 @@ def _synthesize_best_marginal(
             else:
                 sgn = "+"
             if q > 100:
-                tp_q = de.two_pointer(q, K=2)
+                tp_q = de.two_pointer(q, K=2, fast=True)
                 if tp_q:
                     d1q, d2q, pq, gq, sgq = tp_q[0]
                     q_cands.append((gq.bit_length() + r.bit_length(), m, q, r, sgn, tp_q[0]))
@@ -833,7 +929,7 @@ def _synthesize_best_marginal(
 
     # 8. Two-Pointer Product Residual (C99 or Python)
     if v > 100:
-        tp_hits = de.two_pointer(v, K=12)
+        tp_hits = de.two_pointer(v, K=16 if depth >= 2 else 6, fast=(depth <= 1))
         seen_tp: set[int] = set()
         tp_rec = 0
         for d1, d2, prod, gap, sgn in tp_hits:
@@ -1074,12 +1170,33 @@ def solve(
         latent_roots = _discover_latent_roots(targets, de.vl)
         mst_order = _target_mst_order(targets, de)
 
-        orderings = [
-            latent_roots + sorted(targets, key=lambda t: (t.bit_length(), t)),
-            latent_roots + sorted(targets, key=lambda t: (0 if t in smooth_map else 1, t.bit_length(), t)),
-            latent_roots + mst_order,
-            latent_roots + sorted(targets, key=lambda t: (-t.bit_length(), t)),
+        base_orderings = [
+            sorted(targets, key=lambda t: (t.bit_length(), t)),
+            sorted(targets, key=lambda t: (0 if t in smooth_map else 1, t.bit_length(), t)),
+            mst_order,
+            sorted(targets, key=lambda t: (-t.bit_length(), t)),
         ]
+        orderings_true = list(base_orderings)
+        if latent_roots:
+            orderings_true.extend(latent_roots + o for o in base_orderings[:3])
+        orderings_false = list(base_orderings[:3])
+
+        def prune_dag(dmap: dict[int, tuple[str, int, int]], req: list[int] = targets) -> dict[int, tuple[str, int, int]]:
+            keep: dict[int, tuple[str, int, int]] = {}
+            stk = list(req)
+            vis = set(seeds_set)
+            while stk:
+                u = stk.pop()
+                if u in vis or u not in dmap:
+                    continue
+                vis.add(u)
+                op, a, b = dmap[u]
+                keep[u] = (op, a, b)
+                if a not in vis:
+                    stk.append(a)
+                if b not in vis:
+                    stk.append(b)
+            return keep
 
         has_univ = de.univ_ctx is not None
         univ_modes = (True, False) if has_univ else (True,)
@@ -1089,7 +1206,8 @@ def solve(
 
         for allow_u in univ_modes:
             de.set_allow_univ(allow_u)
-            for order in orderings:
+            ords = orderings_true if allow_u else orderings_false
+            for order in ords:
                 active_defs: dict[int, tuple[str, int, int]] = {}
                 active_sorted = sorted(de.seeds)
                 active_set = set(active_sorted)
@@ -1111,15 +1229,16 @@ def solve(
                         if n_bk:
                             added = _sub_dag_new_nodes(n_bk, active_defs, de)
                     if col:
-                        cand_recipes[item].extend(col[:5])
+                        cand_recipes[item].extend(col[:6])
                     if added:
                         active_defs.update(added)
                         active_set.update(added.keys())
                         active_sorted = sorted(active_set)
 
                 if all(t in active_defs or t in seeds_set for t in targets):
-                    if best_defs is None or len(active_defs) < len(best_defs):
-                        best_defs = active_defs
+                    pruned_act = prune_dag(active_defs)
+                    if best_defs is None or len(pruned_act) < len(best_defs):
+                        best_defs = pruned_act
                         best_univ = allow_u
 
         if best_defs is None:
@@ -1127,24 +1246,6 @@ def solve(
             return binary_shared.solve(puzzle)
 
         de.set_allow_univ(best_univ)
-
-        def prune_dag(dmap: dict[int, tuple[str, int, int]], req: list[int] = targets) -> dict[int, tuple[str, int, int]]:
-            keep: dict[int, tuple[str, int, int]] = {}
-            stk = list(req)
-            vis = set(seeds_set)
-            while stk:
-                u = stk.pop()
-                if u in vis:
-                    continue
-                vis.add(u)
-                op, a, b = dmap[u]
-                keep[u] = (op, a, b)
-                if a not in vis:
-                    stk.append(a)
-                if b not in vis:
-                    stk.append(b)
-            return keep
-
         cur_defs = prune_dag(best_defs)
 
         # Single-target Monotone Rip-and-Reroute sweeps
@@ -1170,7 +1271,7 @@ def solve(
                     recipe_collector=col_r,
                 )
                 if col_r:
-                    cand_recipes[t].extend(col_r[:4])
+                    cand_recipes[t].extend(col_r[:5])
                 if new_add is not None:
                     cand_defs = dict(keep_other)
                     cand_defs.update(new_add)
@@ -1198,9 +1299,12 @@ def solve(
                 for x in seq_items:
                     if x in c_set:
                         continue
+                    col_p: list[dict[int, tuple[str, int, int]]] = [] if x in targets else None  # type: ignore[assignment]
                     add_x = _synthesize_best_marginal(
-                        x, c_defs, c_sorted, de, depth=2, extra_cands=smooth_map.get(x)
+                        x, c_defs, c_sorted, de, depth=2, extra_cands=smooth_map.get(x), recipe_collector=col_p
                     )
+                    if col_p:
+                        cand_recipes[x].extend(col_p[:4])
                     if add_x is None:
                         ok_pair = False
                         break
@@ -1212,7 +1316,103 @@ def solve(
                     if len(c_pruned) < len(cur_defs):
                         cur_defs = c_pruned
 
-        n_trials = int(de.profile.get("compiler_trials", 48))
+        # Bridge-Releasing Subtree-Cluster Block-LNS (unlocks bridge targets frozen in single/pair Rip!)
+        if len(targets) >= 3:
+            val_users: dict[int, set[int]] = defaultdict(set)
+            for t in targets:
+                stk = [t]
+                vis = set(seeds_set)
+                while stk:
+                    u = stk.pop()
+                    if u in vis or u not in cur_defs:
+                        continue
+                    vis.add(u)
+                    val_users[u].add(t)
+                    _, pa, pb = cur_defs[u]
+                    stk.append(pa)
+                    stk.append(pb)
+
+            seen_clusters: set[frozenset[int]] = set()
+            cluster_cands: list[tuple[int, list[int]]] = []
+            for t in targets:
+                cl = val_users.get(t, {t})
+                if 2 <= len(cl) <= 5:
+                    fs = frozenset(cl)
+                    if fs not in seen_clusters:
+                        seen_clusters.add(fs)
+                        ko = prune_dag(cur_defs, [x for x in targets if x not in fs])
+                        cluster_cands.append((len(cur_defs) - len(ko), sorted(fs)))
+            for wi in range(min(len(ts_by_bits) - 2, 16)):
+                seed_win = {ts_by_bits[wi], ts_by_bits[wi + 1], ts_by_bits[wi + 2]}
+                exp_cl = set(seed_win)
+                for wt in seed_win:
+                    if len(val_users.get(wt, set())) <= 4:
+                        exp_cl.update(val_users.get(wt, set()))
+                if 2 <= len(exp_cl) <= 5:
+                    fs = frozenset(exp_cl)
+                    if fs not in seen_clusters:
+                        seen_clusters.add(fs)
+                        ko = prune_dag(cur_defs, [x for x in targets if x not in fs])
+                        cluster_cands.append((len(cur_defs) - len(ko), sorted(fs)))
+
+            cluster_cands.sort(key=lambda x: -x[0])
+            t_blk = time.monotonic()
+            for _, cl_list in cluster_cands[:16]:
+                if (time.monotonic() - t_blk) > 4.5:
+                    break
+                cl_set = set(cl_list)
+                keep_other = prune_dag(cur_defs, [x for x in targets if x not in cl_set])
+                if all(x in keep_other or x in seeds_set for x in cl_list):
+                    if len(keep_other) < len(cur_defs):
+                        cur_defs = keep_other
+                    continue
+                g_cl = 0
+                for ia in range(len(cl_list)):
+                    for ib in range(ia + 1, len(cl_list)):
+                        gv = math.gcd(cl_list[ia], cl_list[ib])
+                        if 100 < gv < min(cl_list) and gv > g_cl:
+                            g_cl = gv
+                cl_mst = _target_mst_order(cl_list, de)
+                cl_orders = [cl_list, list(reversed(cl_list)), cl_mst]
+                if g_cl > 100 and g_cl not in keep_other and g_cl not in seeds_set:
+                    cl_orders.append([g_cl] + cl_mst)
+                for ord_cl in cl_orders:
+                    c_defs = dict(keep_other)
+                    c_set = set(c_defs.keys()) | seeds_set
+                    c_sorted = sorted(c_set)
+                    ok_cl = True
+                    for x in ord_cl:
+                        if x in c_set:
+                            continue
+                        col_b: list[dict[int, tuple[str, int, int]]] = [] if x in cl_set else None  # type: ignore[assignment]
+                        add_x = _synthesize_best_marginal(
+                            x, c_defs, c_sorted, de, depth=2, extra_cands=smooth_map.get(x), recipe_collector=col_b
+                        )
+                        if col_b:
+                            cand_recipes[x].extend(col_b[:4])
+                        if add_x is None:
+                            ok_cl = False
+                            break
+                        c_defs.update(add_x)
+                        c_set.update(add_x.keys())
+                        c_sorted = sorted(c_set)
+                    if ok_cl and all(x in c_set for x in cl_list):
+                        c_pruned = prune_dag(c_defs)
+                        if len(c_pruned) < len(cur_defs):
+                            cur_defs = c_pruned
+
+        # Ensure standalone seed-rooted compact recipes exist in MILP pool for every target
+        seed_sorted = sorted(de.seeds)
+        for t in targets:
+            if len(cand_recipes[t]) < 4:
+                col_s: list[dict[int, tuple[str, int, int]]] = []
+                _synthesize_best_marginal(
+                    t, {}, seed_sorted, de, depth=2, extra_cands=smooth_map.get(t), recipe_collector=col_s
+                )
+                if col_s:
+                    cand_recipes[t].extend(col_s[:4])
+
+        n_trials = int(de.profile.get("compiler_trials", 64))
         best_prog = remove_dead_ops(puzzle, compile_dag(puzzle, cur_defs, n_trials=n_trials))
 
         # Bounded HiGHS MILP polish over union of compact recipes

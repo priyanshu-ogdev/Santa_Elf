@@ -239,12 +239,18 @@ def _allocate_schedule(
     seeds = set(puzzle.seeds)
     n_regs = puzzle.registers
 
-    # Compute last direct consumer index for every value
+    # Compute last direct consumer index and all future consumer positions
+    import bisect
     last_use: dict[int, int] = {}
+    use_positions: dict[int, list[int]] = defaultdict(list)
     for idx, v in enumerate(schedule):
         _, a, b = defs[v]
         last_use[a] = idx
-        last_use[b] = idx
+        if b != a:
+            last_use[b] = idx
+        use_positions[a].append(idx)
+        if b != a:
+            use_positions[b].append(idx)
 
     # Compute seed transitive liveness (seed_last_needed[s]):
     # A seed is safe to overwrite ONLY after every scheduled node that transitively
@@ -321,13 +327,13 @@ def _allocate_schedule(
             if not can_remat(lv, live_vals - {lv}, set()):
                 continue
             nxt = 10**9
-            for j in range(step_idx + 1, len(schedule)):
-                _, ua, ub = defs[schedule[j]]
-                if ua == lv or ub == lv:
-                    nxt = j
-                    break
+            up = use_positions.get(lv, [])
+            p0 = bisect.bisect_right(up, step_idx)
+            rem_uses = max(1, len(up) - p0)
+            if p0 < len(up):
+                nxt = up[p0]
             rc = remat_cost_live(lv, live_vals - {lv}, set())
-            sc = (nxt - step_idx) / max(1, rc)
+            sc = (nxt - step_idx) / max(1.0, rc * rem_uses)
             if sc > best_score:
                 best_score = sc
                 best_lv = lv
@@ -389,13 +395,69 @@ def _allocate_schedule(
     return instructions
 
 
+def _schedule_min_live(
+    needed: set[int],
+    defs: dict[int, tuple[str, int, int]],
+    height: dict[int, int],
+) -> list[int]:
+    """
+    Topological Kahn list scheduler minimizing live register pressure:
+    picks the ready node producing the steepest reduction in live registers
+    (freeing operands at their last consumer).
+    """
+    deps_rem: dict[int, int] = {}
+    children: dict[int, list[int]] = defaultdict(list)
+    out_rem: dict[int, int] = defaultdict(int)
+
+    for v in needed:
+        _, a, b = defs[v]
+        need_p = 0
+        if a in needed:
+            need_p += 1
+            children[a].append(v)
+            out_rem[a] += 1
+        if b in needed and b != a:
+            need_p += 1
+            children[b].append(v)
+            out_rem[b] += 1
+        deps_rem[v] = need_p
+
+    ready = {v for v, c in deps_rem.items() if c == 0}
+    sched: list[int] = []
+    while ready:
+        best_v = min(
+            ready,
+            key=lambda v: (
+                1
+                - (1 if defs[v][1] in needed and out_rem[defs[v][1]] == 1 else 0)
+                - (1 if defs[v][2] in needed and defs[v][2] != defs[v][1] and out_rem[defs[v][2]] == 1 else 0),
+                out_rem.get(v, 0),
+                height.get(v, 0),
+                v,
+            ),
+        )
+        ready.remove(best_v)
+        sched.append(best_v)
+        _, a, b = defs[best_v]
+        if a in needed:
+            out_rem[a] -= 1
+        if b in needed and b != a:
+            out_rem[b] -= 1
+        for ch in children.get(best_v, ()):
+            deps_rem[ch] -= 1
+            if deps_rem[ch] == 0:
+                ready.add(ch)
+    return sched
+
+
 def compile_dag(
     puzzle: Puzzle, defs: dict[int, tuple[str, int, int]], *, n_trials: int = 48
 ) -> list[Instruction]:
     """
     Compile an acyclic value DAG `defs` covering all `puzzle.targets` into
     valid 48-register `Instruction`s, minimizing register spills via Min-Cut,
-    Sethi-Ullman / Subtree-Affinity ordering, and local permutation hill-climbing.
+    Sethi-Ullman / Subtree-Affinity ordering, min-live Kahn scheduling, and
+    local permutation hill-climbing.
     """
     seeds = set(puzzle.seeds)
     targets = sorted(set(puzzle.targets) - seeds)
@@ -420,9 +482,8 @@ def compile_dag(
     seen_scheds: set[tuple[int, ...]] = set()
     optimal_len = len(needed)
 
-    def try_order(order: list[int], flip_tie: bool = False) -> bool:
+    def try_schedule(sched: list[int], order_ref: list[int] | None = None) -> bool:
         nonlocal best_prog, best_order
-        sched = _schedule_dfs(order, seeds, defs, height, lighter_first_on_tie=flip_tie)
         key = tuple(sched)
         if key in seen_scheds:
             return False
@@ -431,19 +492,26 @@ def compile_dag(
             prog = _allocate_schedule(puzzle, sched, defs)
             if best_prog is None or len(prog) < len(best_prog):
                 best_prog = prog
-                best_order = list(order)
+                if order_ref is not None:
+                    best_order = list(order_ref)
                 return True
         except RuntimeError:
             pass
         return False
 
-    for order in target_orders:
-        try_order(order, flip_tie=False)
-        if best_prog is not None and len(best_prog) == optimal_len:
-            break
-        try_order(order, flip_tie=True)
-        if best_prog is not None and len(best_prog) == optimal_len:
-            break
+    def try_order(order: list[int], flip_tie: bool = False) -> bool:
+        sched = _schedule_dfs(order, seeds, defs, height, lighter_first_on_tie=flip_tie)
+        return try_schedule(sched, order)
+
+    try_schedule(_schedule_min_live(needed, defs, height))
+    if best_prog is None or len(best_prog) > optimal_len:
+        for order in target_orders:
+            try_order(order, flip_tie=False)
+            if best_prog is not None and len(best_prog) == optimal_len:
+                break
+            try_order(order, flip_tie=True)
+            if best_prog is not None and len(best_prog) == optimal_len:
+                break
 
     # Permutation hill-climbing if any register spill remains
     if best_prog is not None and len(best_prog) > optimal_len and len(targets) > 2 and n_trials > 0:
@@ -451,7 +519,7 @@ def compile_dag(
         t_start = time.monotonic()
         cur_order = list(best_order)
         for trial in range(n_trials):
-            if (time.monotonic() - t_start) > 0.30:
+            if (time.monotonic() - t_start) > 0.90:
                 break
             cand_order = list(cur_order)
             if trial % 3 == 0:

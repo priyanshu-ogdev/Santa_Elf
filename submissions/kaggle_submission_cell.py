@@ -709,12 +709,18 @@ def _allocate_schedule(
     seeds = set(puzzle.seeds)
     n_regs = puzzle.registers
 
-    # Compute last direct consumer index for every value
+    # Compute last direct consumer index and all future consumer positions
+    import bisect
     last_use: dict[int, int] = {}
+    use_positions: dict[int, list[int]] = defaultdict(list)
     for idx, v in enumerate(schedule):
         _, a, b = defs[v]
         last_use[a] = idx
-        last_use[b] = idx
+        if b != a:
+            last_use[b] = idx
+        use_positions[a].append(idx)
+        if b != a:
+            use_positions[b].append(idx)
 
     # Compute seed transitive liveness (seed_last_needed[s]):
     # A seed is safe to overwrite ONLY after every scheduled node that transitively
@@ -791,13 +797,13 @@ def _allocate_schedule(
             if not can_remat(lv, live_vals - {lv}, set()):
                 continue
             nxt = 10**9
-            for j in range(step_idx + 1, len(schedule)):
-                _, ua, ub = defs[schedule[j]]
-                if ua == lv or ub == lv:
-                    nxt = j
-                    break
+            up = use_positions.get(lv, [])
+            p0 = bisect.bisect_right(up, step_idx)
+            rem_uses = max(1, len(up) - p0)
+            if p0 < len(up):
+                nxt = up[p0]
             rc = remat_cost_live(lv, live_vals - {lv}, set())
-            sc = (nxt - step_idx) / max(1, rc)
+            sc = (nxt - step_idx) / max(1.0, rc * rem_uses)
             if sc > best_score:
                 best_score = sc
                 best_lv = lv
@@ -859,13 +865,69 @@ def _allocate_schedule(
     return instructions
 
 
+def _schedule_min_live(
+    needed: set[int],
+    defs: dict[int, tuple[str, int, int]],
+    height: dict[int, int],
+) -> list[int]:
+    """
+    Topological Kahn list scheduler minimizing live register pressure:
+    picks the ready node producing the steepest reduction in live registers
+    (freeing operands at their last consumer).
+    """
+    deps_rem: dict[int, int] = {}
+    children: dict[int, list[int]] = defaultdict(list)
+    out_rem: dict[int, int] = defaultdict(int)
+
+    for v in needed:
+        _, a, b = defs[v]
+        need_p = 0
+        if a in needed:
+            need_p += 1
+            children[a].append(v)
+            out_rem[a] += 1
+        if b in needed and b != a:
+            need_p += 1
+            children[b].append(v)
+            out_rem[b] += 1
+        deps_rem[v] = need_p
+
+    ready = {v for v, c in deps_rem.items() if c == 0}
+    sched: list[int] = []
+    while ready:
+        best_v = min(
+            ready,
+            key=lambda v: (
+                1
+                - (1 if defs[v][1] in needed and out_rem[defs[v][1]] == 1 else 0)
+                - (1 if defs[v][2] in needed and defs[v][2] != defs[v][1] and out_rem[defs[v][2]] == 1 else 0),
+                out_rem.get(v, 0),
+                height.get(v, 0),
+                v,
+            ),
+        )
+        ready.remove(best_v)
+        sched.append(best_v)
+        _, a, b = defs[best_v]
+        if a in needed:
+            out_rem[a] -= 1
+        if b in needed and b != a:
+            out_rem[b] -= 1
+        for ch in children.get(best_v, ()):
+            deps_rem[ch] -= 1
+            if deps_rem[ch] == 0:
+                ready.add(ch)
+    return sched
+
+
 def compile_dag(
     puzzle: Puzzle, defs: dict[int, tuple[str, int, int]], *, n_trials: int = 48
 ) -> list[Instruction]:
     """
     Compile an acyclic value DAG `defs` covering all `puzzle.targets` into
     valid 48-register `Instruction`s, minimizing register spills via Min-Cut,
-    Sethi-Ullman / Subtree-Affinity ordering, and local permutation hill-climbing.
+    Sethi-Ullman / Subtree-Affinity ordering, min-live Kahn scheduling, and
+    local permutation hill-climbing.
     """
     seeds = set(puzzle.seeds)
     targets = sorted(set(puzzle.targets) - seeds)
@@ -890,9 +952,8 @@ def compile_dag(
     seen_scheds: set[tuple[int, ...]] = set()
     optimal_len = len(needed)
 
-    def try_order(order: list[int], flip_tie: bool = False) -> bool:
+    def try_schedule(sched: list[int], order_ref: list[int] | None = None) -> bool:
         nonlocal best_prog, best_order
-        sched = _schedule_dfs(order, seeds, defs, height, lighter_first_on_tie=flip_tie)
         key = tuple(sched)
         if key in seen_scheds:
             return False
@@ -901,19 +962,26 @@ def compile_dag(
             prog = _allocate_schedule(puzzle, sched, defs)
             if best_prog is None or len(prog) < len(best_prog):
                 best_prog = prog
-                best_order = list(order)
+                if order_ref is not None:
+                    best_order = list(order_ref)
                 return True
         except RuntimeError:
             pass
         return False
 
-    for order in target_orders:
-        try_order(order, flip_tie=False)
-        if best_prog is not None and len(best_prog) == optimal_len:
-            break
-        try_order(order, flip_tie=True)
-        if best_prog is not None and len(best_prog) == optimal_len:
-            break
+    def try_order(order: list[int], flip_tie: bool = False) -> bool:
+        sched = _schedule_dfs(order, seeds, defs, height, lighter_first_on_tie=flip_tie)
+        return try_schedule(sched, order)
+
+    try_schedule(_schedule_min_live(needed, defs, height))
+    if best_prog is None or len(best_prog) > optimal_len:
+        for order in target_orders:
+            try_order(order, flip_tie=False)
+            if best_prog is not None and len(best_prog) == optimal_len:
+                break
+            try_order(order, flip_tie=True)
+            if best_prog is not None and len(best_prog) == optimal_len:
+                break
 
     # Permutation hill-climbing if any register spill remains
     if best_prog is not None and len(best_prog) > optimal_len and len(targets) > 2 and n_trials > 0:
@@ -921,7 +989,7 @@ def compile_dag(
         t_start = time.monotonic()
         cur_order = list(best_order)
         for trial in range(n_trials):
-            if (time.monotonic() - t_start) > 0.30:
+            if (time.monotonic() - t_start) > 0.90:
                 break
             cand_order = list(cur_order)
             if trial % 3 == 0:
@@ -2347,39 +2415,39 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
         eff_gb = max(avail_gb, 25.0) if (on_kaggle and total_gb >= 24.0) else avail_gb
 
     if eff_gb >= 22.0:
-        # Kaggle ~14-20 GB aggregate budget across 31.35 GB host:
+        # Kaggle ~13-19 GB aggregate budget across 31.35 GB host:
         #   U: 240M nodes x 16B (3.84 GB) + HT=2^30 x 4B (4.29 GB) = ~8.14 GB Read-Only CoW
-        #   + 4 workers x (36M local ~1.11 GB + 1.2M scan + MITM + beam + 5.5k MILP) ~ 6-10 GB
+        #   + 4 workers x (24M local ~652 MB + 10M radix-sorted scan ~90 MB + MITM + MILP) ~ 5-9 GB
         return {
             "mode": "kaggle_high_ram",
             "eff_gb": eff_gb,
             "univ_cap": 240_000_000,
             "univ_ht_pow": 30,
-            "local_cap": 36_000_000,
+            "local_cap": 24_000_000,
             "local_ht_pow": 26,
-            "local_scan": 1_200_000,
-            "per_bucket": 600_000,
-            "mitm_div_scan": 260_000,
+            "local_scan": 10_000_000,
+            "per_bucket": 500_000,
+            "mitm_div_scan": 420_000,
             "smooth_offset_lim": 256,
-            "milp_max_edges": 5500,
-            "milp_time": 2.0,
-            "compiler_trials": 64,
+            "milp_max_edges": 7000,
+            "milp_time": 2.5,
+            "compiler_trials": 120,
         }
     if eff_gb >= 14.0:
         return {
             "mode": "high_ram_16g",
             "eff_gb": eff_gb,
-            "univ_cap": 280_000_000,
+            "univ_cap": 240_000_000,
             "univ_ht_pow": 30,
             "local_cap": 4_000_000,
             "local_ht_pow": 24,
-            "local_scan": 600_000,
-            "per_bucket": 65_000,
-            "mitm_div_scan": 220_000,
+            "local_scan": 2_500_000,
+            "per_bucket": 75_000,
+            "mitm_div_scan": 260_000,
             "smooth_offset_lim": 200,
-            "milp_max_edges": 3000,
-            "milp_time": 1.5,
-            "compiler_trials": 48,
+            "milp_max_edges": 4000,
+            "milp_time": 1.8,
+            "compiler_trials": 80,
         }
     if eff_gb >= 6.5:
         return {
@@ -2387,30 +2455,30 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
             "eff_gb": eff_gb,
             "univ_cap": 60_000_000,
             "univ_ht_pow": 27,
-            "local_cap": 1_500_000,
+            "local_cap": 1_800_000,
             "local_ht_pow": 22,
-            "local_scan": 450_000,
-            "per_bucket": 25_000,
-            "mitm_div_scan": 180_000,
+            "local_scan": 1_200_000,
+            "per_bucket": 35_000,
+            "mitm_div_scan": 200_000,
             "smooth_offset_lim": 160,
-            "milp_max_edges": 2500,
-            "milp_time": 1.0,
-            "compiler_trials": 48,
+            "milp_max_edges": 3000,
+            "milp_time": 1.2,
+            "compiler_trials": 64,
         }
     return {
         "mode": "compact_ram",
         "eff_gb": eff_gb,
         "univ_cap": 8_000_000,
         "univ_ht_pow": 25,
-        "local_cap": 600_000,
+        "local_cap": 800_000,
         "local_ht_pow": 21,
-        "local_scan": 300_000,
-        "per_bucket": 10_000,
-        "mitm_div_scan": 150_000,
+        "local_scan": 800_000,
+        "per_bucket": 16_000,
+        "mitm_div_scan": 160_000,
         "smooth_offset_lim": 96,
-        "milp_max_edges": 1500,
-        "milp_time": 0.5,
-        "compiler_trials": 40,
+        "milp_max_edges": 2000,
+        "milp_time": 0.6,
+        "compiler_trials": 64,
     }
 
 
@@ -2525,6 +2593,30 @@ typedef struct { uint64_t v; uint8_t c; } SortPair;
 static int cmp_sp(const void *a, const void *b) {
     uint64_t va = ((const SortPair *)a)->v, vb = ((const SortPair *)b)->v;
     return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+}
+
+static void radix_sort_sp(SortPair *a, uint32_t n) {
+    if (n <= 1U) return;
+    if (n <= 2048U) { qsort(a, n, sizeof(SortPair), cmp_sp); return; }
+    SortPair *tmp = (SortPair *)malloc((size_t)n * sizeof(SortPair));
+    if (!tmp) { qsort(a, n, sizeof(SortPair), cmp_sp); return; }
+    SortPair *src = a, *dst = tmp;
+    uint32_t cnt[256], off[256];
+    for (int shift = 0; shift < 64; shift += 8) {
+        memset(cnt, 0, sizeof(cnt));
+        for (uint32_t i = 0; i < n; i++) cnt[(src[i].v >> shift) & 255U]++;
+        uint32_t fb = (uint32_t)((src[0].v >> shift) & 255U);
+        if (cnt[fb] == n) continue;
+        uint32_t sum = 0U;
+        for (int b = 0; b < 256; b++) { off[b] = sum; sum += cnt[b]; }
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t b = (uint32_t)((src[i].v >> shift) & 255U);
+            dst[off[b]++] = src[i];
+        }
+        SortPair *sw = src; src = dst; dst = sw;
+    }
+    if (src != a) memcpy(a, src, (size_t)n * sizeof(SortPair));
+    free(tmp);
 }
 
 static void free_bigdict(BigDict *d) {
@@ -2794,8 +2886,8 @@ EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow, int n_threads) {
         d->n = total_valid;
     }
 
-    /* Extract compact high-yield divisor array `scan_vals` (~300k items: 100k <=23b + 200k 24..34b) */
-    uint32_t max_udiv = 300000U;
+    /* Extract compact high-yield divisor array `scan_vals` (~1.2M items: 400k <=23b + 800k 24..34b) */
+    uint32_t max_udiv = 1200000U;
     d->scan_vals = (uint64_t *)malloc(sizeof(uint64_t) * max_udiv);
     d->scan_costs = (uint8_t *)malloc(sizeof(uint8_t) * max_udiv);
     if (d->scan_vals && d->scan_costs) {
@@ -2804,16 +2896,16 @@ EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow, int n_threads) {
             uint64_t v = d->vals[k];
             if (v <= 1ULL) continue;
             int bl = bl64(v);
-            if (bl <= 23 && cnt_lo < 100000U) {
+            if (bl <= 23 && cnt_lo < 400000U) {
                 d->scan_vals[out_u] = v;
                 d->scan_costs[out_u] = meta_cost(d->meta[k]);
                 cnt_lo++; out_u++;
-            } else if (bl >= 24 && bl <= 34 && cnt_mid < 200000U) {
+            } else if (bl >= 24 && bl <= 34 && cnt_mid < 800000U) {
                 d->scan_vals[out_u] = v;
                 d->scan_costs[out_u] = meta_cost(d->meta[k]);
                 cnt_mid++; out_u++;
             }
-            if (cnt_lo >= 100000U && cnt_mid >= 200000U) break;
+            if (cnt_lo >= 400000U && cnt_mid >= 800000U) break;
         }
         d->n_scan = out_u;
         d->alloc_bytes += (uint64_t)(sizeof(uint64_t) + sizeof(uint8_t)) * max_udiv;
@@ -2852,6 +2944,23 @@ EXPORT uint32_t fe_dict_copy_scan(void *p, uint64_t *out) {
     const BigDict *d = (const BigDict *)p;
     for (uint32_t i = 0; i < d->n_scan; i++) out[i] = d->scan_vals[i];
     return d->n_scan;
+}
+
+EXPORT uint32_t fe_dict_copy_scan_prefix(void *p, uint64_t *out, uint32_t max_n) {
+    const BigDict *d = (const BigDict *)p;
+    uint32_t n = d->n_scan;
+    if (n <= max_n) {
+        for (uint32_t i = 0; i < n; i++) out[i] = d->scan_vals[i];
+        return n;
+    }
+    uint32_t half = max_n / 2U;
+    for (uint32_t i = 0; i < half; i++) out[i] = d->scan_vals[i];
+    uint64_t rem_slots = max_n - half;
+    uint64_t avail = n - half;
+    for (uint64_t s = 0; s < rem_slots; s++) {
+        out[half + (uint32_t)s] = d->scan_vals[half + (uint32_t)((s * avail) / rem_slots)];
+    }
+    return max_n;
 }
 
 /*
@@ -3014,7 +3123,7 @@ EXPORT void* fe_local_create(
         }
     }
 
-    /* Build stratified sorted scan slice up to scan_cap */
+    /* Build cost-prioritized stratified sorted scan slice up to scan_cap via LSD Radix Sort */
     uint32_t ns_tot = d->n < scan_cap ? d->n : scan_cap;
     SortPair *sp = (SortPair *)malloc(sizeof(SortPair) * ns_tot);
     d->scan_vals  = (uint64_t *)malloc(sizeof(uint64_t) * ns_tot);
@@ -3028,22 +3137,55 @@ EXPORT void* fe_local_create(
                 filled++;
             }
         } else {
-            uint32_t keep_front = base_end < (ns_tot / 3) ? base_end : (ns_tot / 3);
-            for (uint32_t i = 0; i < keep_front; i++) {
-                sp[filled].v = d->vals[i];
-                sp[filled].c = meta_cost(d->meta[i]);
-                filled++;
-            }
-            uint64_t rem_slots = ns_tot - filled;
-            uint64_t avail = d->n - keep_front;
-            for (uint64_t s = 0; s < rem_slots && filled < ns_tot; s++) {
-                uint32_t idx = keep_front + (uint32_t)((s * avail) / rem_slots);
-                sp[filled].v = d->vals[idx];
-                sp[filled].c = meta_cost(d->meta[idx]);
-                filled++;
+            uint8_t *used = (uint8_t *)calloc((size_t)((d->n + 7U) >> 3), 1);
+            if (used) {
+                for (uint32_t i = 0; i < d->n && filled < ns_tot; i++) {
+                    uint8_t cc = meta_cost(d->meta[i]);
+                    if (cc <= 6) {
+                        sp[filled].v = d->vals[i];
+                        sp[filled].c = cc;
+                        filled++;
+                        used[i >> 3] |= (uint8_t)(1U << (i & 7U));
+                    }
+                }
+                uint32_t p2_cap = (ns_tot * 85U) / 100U;
+                if (filled < p2_cap) {
+                    for (uint32_t i = 0; i < d->n && filled < p2_cap; i++) {
+                        if (used[i >> 3] & (1U << (i & 7U))) continue;
+                        uint8_t cc = meta_cost(d->meta[i]);
+                        if (cc <= 8 && bl64(d->vals[i]) <= 38) {
+                            sp[filled].v = d->vals[i];
+                            sp[filled].c = cc;
+                            filled++;
+                            used[i >> 3] |= (uint8_t)(1U << (i & 7U));
+                        }
+                    }
+                }
+                if (filled < ns_tot) {
+                    uint64_t rem_slots = ns_tot - filled;
+                    uint64_t avail = d->n;
+                    for (uint64_t s = 0; s < rem_slots && filled < ns_tot; s++) {
+                        uint32_t idx = (uint32_t)((s * avail) / rem_slots);
+                        while (idx < d->n && (used[idx >> 3] & (1U << (idx & 7U)))) idx++;
+                        if (idx < d->n) {
+                            sp[filled].v = d->vals[idx];
+                            sp[filled].c = meta_cost(d->meta[idx]);
+                            filled++;
+                            used[idx >> 3] |= (uint8_t)(1U << (idx & 7U));
+                        }
+                    }
+                }
+                free(used);
+            } else {
+                for (uint64_t s = 0; s < ns_tot && filled < ns_tot; s++) {
+                    uint32_t idx = (uint32_t)((s * d->n) / ns_tot);
+                    sp[filled].v = d->vals[idx];
+                    sp[filled].c = meta_cost(d->meta[idx]);
+                    filled++;
+                }
             }
         }
-        qsort(sp, filled, sizeof(SortPair), cmp_sp);
+        radix_sort_sp(sp, filled);
         for (uint32_t i = 0; i < filled; i++) {
             d->scan_vals[i]  = sp[i].v;
             d->scan_costs[i] = sp[i].c;
@@ -3058,11 +3200,11 @@ EXPORT void* fe_local_create(
 typedef struct { uint64_t d1, d2, prod, gap; int32_t metric; uint8_t sgn; } Hit;
 
 /*
- * Fast O(N) Two-Pointer Scan with zero multi-GB DRAM misses:
- * Uses L3-resident `seen24` bitsets for instant ~1ns residual hit checks!
+ * Fast Bounded + Strided O(N/stride) Two-Pointer Scan:
+ * Binary-searches upper product bound and uses L3-resident `seen24` bitsets.
  */
-EXPORT int fe_two_pointer(
-    void *p_local, void *p_univ, uint64_t tgt, int K,
+EXPORT int fe_two_pointer_s(
+    void *p_local, void *p_univ, uint64_t tgt, int K, int stride,
     uint64_t *od1, uint64_t *od2, uint64_t *oprod, uint64_t *ogap, int *osgn
 ) {
     const BigDict *d = (const BigDict *)p_local;
@@ -3070,6 +3212,7 @@ EXPORT int fe_two_pointer(
     int N = (int)d->n_scan;
     if (N == 0) return 0;
     if (K > 64) K = 64;
+    if (stride < 1) stride = 1;
 
     Hit hits_gap[32]; int ng = 0, wg = 0;
     Hit hits_sc[32];  int ns = 0, ws = 0;
@@ -3078,9 +3221,18 @@ EXPORT int fe_two_pointer(
 
     const uint64_t *d_s24 = d->seen24;
     const uint64_t *u_s24 = u ? u->seen24 : NULL;
-    int i = 0, j = N - 1;
     u128 t128 = (u128)tgt;
     u128 vl128 = (u128)d->vl;
+
+    uint64_t a0 = d->scan_vals[0] > 0ULL ? d->scan_vals[0] : 1ULL;
+    u128 max_b128 = ((t128 * 2ULL) / (u128)a0) + 4096ULL;
+    int lo = 0, hi = N;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        if ((u128)d->scan_vals[mid] <= max_b128) lo = mid + 1;
+        else hi = mid;
+    }
+    int i = 0, j = (lo > 0) ? (lo - 1) : 0;
 
     while (i <= j) {
         uint64_t a = d->scan_vals[i], b = d->scan_vals[j];
@@ -3118,8 +3270,8 @@ EXPORT int fe_two_pointer(
                 }
             }
         }
-        if (prod < t128) i++;
-        else if (prod > t128) j--;
+        if (prod < t128) i += stride;
+        else if (prod > t128) j -= stride;
         else break;
     }
 
@@ -3135,6 +3287,121 @@ EXPORT int fe_two_pointer(
         out++;
     }
     return out;
+}
+
+EXPORT int fe_two_pointer(
+    void *p_local, void *p_univ, uint64_t tgt, int K,
+    uint64_t *od1, uint64_t *od2, uint64_t *oprod, uint64_t *ogap, int *osgn
+) {
+    return fe_two_pointer_s(p_local, p_univ, tgt, K, 1, od1, od2, oprod, ogap, osgn);
+}
+
+typedef struct { uint64_t a, qq, prod, gap; int32_t sc; uint8_t sgn; } AncHit;
+
+static inline int anc_gap_cost(const BigDict *d, const BigDict *u, uint64_t g) {
+    if (g == 0ULL) return 0;
+    if (g < (1ULL << 24)) {
+        if (d->seen24 && (d->seen24[g >> 6] & (1ULL << (g & 63)))) {
+            int32_t id = bd_find(d, g);
+            if (id >= 0) return (int)meta_cost(d->meta[id]) + 1;
+        }
+        if (u && u->seen24 && (u->seen24[g >> 6] & (1ULL << (g & 63)))) {
+            int32_t iu = bd_find(u, g);
+            if (iu >= 0) return (int)meta_cost(u->meta[iu]) + 3;
+        }
+    } else if (g < (1ULL << 38)) {
+        int32_t id = bd_find(d, g);
+        if (id >= 0) return (int)meta_cost(d->meta[id]) + 1;
+    }
+    return bl64(g) / 3 + 4;
+}
+
+static inline void anc_push(
+    AncHit *arr, int *n, int *w, int K, uint64_t a, uint64_t qq, uint64_t prod, uint64_t gap, int32_t sc, uint8_t sgn
+) {
+    if (*n < K) {
+        arr[*n] = (AncHit){a, qq, prod, gap, sc, sgn};
+        if (arr[*n].sc > arr[*w].sc) *w = *n;
+        (*n)++;
+    } else if (sc < arr[*w].sc) {
+        arr[*w] = (AncHit){a, qq, prod, gap, sc, sgn};
+        *w = 0;
+        for (int h = 1; h < *n; h++) if (arr[h].sc > arr[*w].sc) *w = h;
+    }
+}
+
+/*
+ * Fast C99 Active-Anchor Binary Search over ALL live DAG nodes (not truncated!),
+ * scoring proposals cleanly by true dict + gap bitset cost instead of raw magnitude.
+ */
+EXPORT int fe_anchor_scan(
+    void *p_local, void *p_univ, uint64_t tgt, uint64_t vl,
+    const uint64_t *act_vals, int n_act, int K,
+    uint64_t *oa, uint64_t *oq, uint64_t *oprod, uint64_t *ogap, int *osgn, int *osc
+) {
+    const BigDict *d = (const BigDict *)p_local;
+    const BigDict *u = (const BigDict *)p_univ;
+    if (!d || K <= 0) return 0;
+    if (K > 32) K = 32;
+    AncHit hits[32];
+    int nh = 0, wh = 0;
+    uint32_t nD = d->n_scan;
+
+    for (int i = 0; i < n_act; i++) {
+        uint64_t a = act_vals[i];
+        if (a <= 1ULL || a >= tgt || (a & (a - 1ULL)) == 0ULL) continue;
+        uint64_t q_int = tgt / a;
+
+        for (int pass = 0; pass < 2; pass++) {
+            uint64_t qq = q_int + (uint64_t)pass;
+            if (qq < 1ULL || (u128)a * (u128)qq > (u128)vl) continue;
+            int cq = -1;
+            if (qq == 1ULL) cq = 0;
+            else if (qq <= 256ULL) cq = bl64(qq) / 2 + 2;
+            else {
+                int32_t id = bd_find(d, qq);
+                if (id >= 0) cq = (int)meta_cost(d->meta[id]) + 1;
+                else if (u) {
+                    int32_t iu = bd_find(u, qq);
+                    if (iu >= 0) cq = (int)meta_cost(u->meta[iu]) + 3;
+                }
+            }
+            if (cq >= 0) {
+                uint64_t prod = a * qq;
+                uint64_t gap = (tgt >= prod) ? (tgt - prod) : (prod - tgt);
+                uint8_t sgn = (tgt >= prod) ? 1 : 0;
+                int32_t sc = cq + anc_gap_cost(d, u, gap) + (gap ? 1 : 0);
+                anc_push(hits, &nh, &wh, K, a, qq, prod, gap, sc, sgn);
+            }
+        }
+
+        if (nD > 0U) {
+            uint32_t lo = 0U, hi = nD;
+            while (lo < hi) {
+                uint32_t mid = lo + ((hi - lo) >> 1);
+                if (d->scan_vals[mid] < q_int) lo = mid + 1U;
+                else hi = mid;
+            }
+            for (int off = -1; off <= 1; off++) {
+                int64_t p = (int64_t)lo + off;
+                if (p >= 0 && p < (int64_t)nD) {
+                    uint64_t qq = d->scan_vals[p];
+                    if (qq == 0ULL || (u128)a * (u128)qq > (u128)vl) continue;
+                    uint64_t prod = a * qq;
+                    uint64_t gap = (tgt >= prod) ? (tgt - prod) : (prod - tgt);
+                    uint8_t sgn = (tgt >= prod) ? 1 : 0;
+                    int32_t sc = (int32_t)d->scan_costs[p] + 1 + anc_gap_cost(d, u, gap) + (gap ? 1 : 0);
+                    anc_push(hits, &nh, &wh, K, a, qq, prod, gap, sc, sgn);
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < nh; i++) {
+        oa[i] = hits[i].a; oq[i] = hits[i].qq; oprod[i] = hits[i].prod;
+        ogap[i] = hits[i].gap; osgn[i] = (int)hits[i].sgn; osc[i] = (int)hits[i].sc;
+    }
+    return nh;
 }
 
 typedef struct { uint64_t a, q, r; int32_t sc; uint8_t sgn; } MitmHit;
@@ -3754,11 +4021,11 @@ def get_clib() -> Optional[ctypes.CDLL]:
     try:
         ext = ".dll" if os.name == "nt" else ".so"
         tdir = tempfile.gettempdir()
-        so_path = os.path.join(tdir, f"santa2026_fast_engine_v8{ext}")
+        so_path = os.path.join(tdir, f"santa2026_fast_engine_v9{ext}")
         if not os.path.exists(so_path):
             pid = os.getpid()
-            c_path = os.path.join(tdir, f"santa2026_fast_engine_v8_{pid}.c")
-            tmp_so = os.path.join(tdir, f"santa2026_fast_engine_v8_{pid}{ext}")
+            c_path = os.path.join(tdir, f"santa2026_fast_engine_v9_{pid}.c")
+            tmp_so = os.path.join(tdir, f"santa2026_fast_engine_v9_{pid}{ext}")
             with open(c_path, "w", encoding="utf-8") as f:
                 f.write(_C_SOURCE)
             flags = ["gcc", "-O3", "-shared", "-fPIC"] + (["-static-libgcc"] if os.name == "nt" else ["-pthread"])
@@ -3814,6 +4081,10 @@ def get_clib() -> Optional[ctypes.CDLL]:
         ]
         lib.fe_dict_copy_scan.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
         lib.fe_dict_copy_scan.restype = ctypes.c_uint32
+        lib.fe_dict_copy_scan_prefix.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32
+        ]
+        lib.fe_dict_copy_scan_prefix.restype = ctypes.c_uint32
 
         lib.fe_two_pointer.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int,
@@ -3822,6 +4093,23 @@ def get_clib() -> Optional[ctypes.CDLL]:
             ctypes.POINTER(ctypes.c_int),
         ]
         lib.fe_two_pointer.restype = ctypes.c_int
+
+        lib.fe_two_pointer_s.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.fe_two_pointer_s.restype = ctypes.c_int
+
+        lib.fe_anchor_scan.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.fe_anchor_scan.restype = ctypes.c_int
 
         lib.fe_mitm_probe.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
@@ -4110,10 +4398,11 @@ class DictEngine:
         self._node_cache: dict[int, Optional[tuple[str, int, int]]] = {}
         self._has_cache: dict[int, bool] = {}
         self._cost_cache: dict[int, int] = {}
-        self._tp_cache: dict[int, list[tuple[int, int, int, int, int]]] = {}
+        self._tp_cache: dict[tuple[int, bool, bool], list[tuple[int, int, int, int, int]]] = {}
         self._mitm_cache: dict[tuple[int, bool], list[tuple[int, int, int, int, int]]] = {}
         self.ctx = None
         self.univ_ctx = None
+        self.c_scan_size = 0
         self.py_backend: Optional[_PyDictBackend] = None
 
         self.clib = None if force_python else get_clib()
@@ -4134,10 +4423,11 @@ class DictEngine:
 
             if self.ctx:
                 self.univ_ctx = _UNIV_CTX
-                ns = int(self.clib.fe_scan_size(self.ctx))
-                c_arr = (ctypes.c_uint64 * ns)()
-                self.clib.fe_dict_copy_scan(self.ctx, c_arr)
-                self.D_sorted = list(c_arr)
+                self.c_scan_size = int(self.clib.fe_scan_size(self.ctx))
+                py_ns = min(self.c_scan_size, 200_000)
+                c_arr = (ctypes.c_uint64 * py_ns)()
+                got = int(self.clib.fe_dict_copy_scan_prefix(self.ctx, c_arr, ctypes.c_uint32(py_ns)))
+                self.D_sorted = list(c_arr[:got])
             else:
                 self.clib = None
 
@@ -4174,7 +4464,6 @@ class DictEngine:
         self._node_cache.clear()
         self._has_cache.clear()
         self._cost_cache.clear()
-        self._tp_cache.clear()
         self.powers.clear()
         pw = 1
         while pw <= self.vl:
@@ -4275,24 +4564,82 @@ class DictEngine:
         self._node_cache[v] = res
         return res
 
-    def two_pointer(self, tgt: int, K: int = 14) -> list[tuple[int, int, int, int, int]]:
-        if tgt in self._tp_cache:
-            return self._tp_cache[tgt]
+    def two_pointer(
+        self, tgt: int, K: int = 16, *, fast: bool = False
+    ) -> list[tuple[int, int, int, int, int]]:
+        t_key = (tgt, self.univ_ctx is not None, fast)
+        if t_key in self._tp_cache:
+            return self._tp_cache[t_key]
         if self.py_backend is not None:
             res = self.py_backend.two_pointer(tgt, K=K)
-            self._tp_cache[tgt] = res
+            self._tp_cache[t_key] = res
             return res
+        stride = max(1, self.c_scan_size // 500_000) if fast else 1
         od1 = (ctypes.c_uint64 * K)()
         od2 = (ctypes.c_uint64 * K)()
         oprod = (ctypes.c_uint64 * K)()
         ogap = (ctypes.c_uint64 * K)()
         osgn = (ctypes.c_int * K)()
-        nh = self.clib.fe_two_pointer(
-            self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), K,
+        nh = self.clib.fe_two_pointer_s(
+            self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), K, stride,
             od1, od2, oprod, ogap, osgn
         )
         res = [(od1[i], od2[i], oprod[i], ogap[i], osgn[i]) for i in range(nh)]
-        self._tp_cache[tgt] = res
+        self._tp_cache[t_key] = res
+        return res
+
+    def anchor_scan(
+        self, tgt: int, active_vals: list[int], K: int = 16
+    ) -> list[tuple[int, int, int, int, int, int]]:
+        """
+        C99 binary search across ALL active DAG intermediates `a` against full `D_local` scan,
+        returning `(est_sc, gap, a, qq, prod, sgn)` sorted by lowest estimated cost.
+        """
+        if not active_vals or tgt <= 1:
+            return []
+        if self.py_backend is not None or self.ctx is None:
+            import bisect
+            D_s = self.D_sorted
+            nD = len(D_s)
+            hits: list[tuple[int, int, int, int, int, int]] = []
+            for a in active_vals:
+                if a <= 1 or a >= tgt or (a & (a - 1)) == 0:
+                    continue
+                qi = tgt // a
+                for qq in (qi, qi + 1):
+                    if qq >= 1 and a * qq <= self.vl and (qq <= 256 or self.has(qq)):
+                        prod = a * qq
+                        gap = abs(tgt - prod)
+                        sc = (0 if qq == 1 else self.lookup_cost(qq) + 1) + (
+                            0 if gap == 0 else (gap.bit_length() // 3 + 4)
+                        )
+                        hits.append((sc, gap, a, qq, prod, 1 if tgt >= prod else 0))
+                pos = bisect.bisect_left(D_s, qi)
+                for off in (-1, 0, 1):
+                    if 0 <= pos + off < nD:
+                        qq = D_s[pos + off]
+                        prod = a * qq
+                        if 0 < prod <= self.vl:
+                            gap = abs(tgt - prod)
+                            sc = 5 + (0 if gap == 0 else (gap.bit_length() // 3 + 4))
+                            hits.append((sc, gap, a, qq, prod, 1 if tgt >= prod else 0))
+            hits.sort(key=lambda x: (x[0], x[1]))
+            return hits[:K]
+
+        na = min(len(active_vals), 512)
+        act_arr = (ctypes.c_uint64 * na)(*active_vals[-na:])
+        oa = (ctypes.c_uint64 * K)()
+        oq = (ctypes.c_uint64 * K)()
+        oprod = (ctypes.c_uint64 * K)()
+        ogap = (ctypes.c_uint64 * K)()
+        osgn = (ctypes.c_int * K)()
+        osc = (ctypes.c_int * K)()
+        nh = self.clib.fe_anchor_scan(
+            self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), ctypes.c_uint64(self.vl),
+            act_arr, na, K, oa, oq, oprod, ogap, osgn, osc
+        )
+        res = [(osc[i], ogap[i], oa[i], oq[i], oprod[i], osgn[i]) for i in range(nh)]
+        res.sort(key=lambda x: (x[0], x[1]))
         return res
 
     def mitm_probe(
@@ -4444,6 +4791,7 @@ Optimization stages:
 """
 import bisect
 import math
+import time
 from collections import Counter, defaultdict
 from typing import Optional
 
@@ -4514,7 +4862,7 @@ def _pollard_rho(n: int) -> int:
     return n
 
 
-def _factor_hybrid(n: int, rho_limit: int = 10**9) -> tuple[list[int], int]:
+def _factor_hybrid(n: int, rho_limit: int = 10**11) -> tuple[list[int], int]:
     """
     Factor `n` using primes <= 2000 plus bounded Pollard's Rho up to `rho_limit`.
     Returns (list_of_small_or_medium_factors, remaining_unfactored).
@@ -4522,7 +4870,7 @@ def _factor_hybrid(n: int, rho_limit: int = 10**9) -> tuple[list[int], int]:
     facs: list[int] = []
     for p in _SMALL_PRIMES:
         if p * p > n:
-            if 1 < n <= 50000:
+            if 1 < n <= (1 << 25):
                 facs.append(n)
                 n = 1
             break
@@ -4537,8 +4885,8 @@ def _factor_hybrid(n: int, rho_limit: int = 10**9) -> tuple[list[int], int]:
             m = stk.pop()
             if m <= 1:
                 continue
-            if m <= 50000 or _is_prime(m):
-                if m <= 50000:
+            if m <= (1 << 24) or _is_prime(m):
+                if m <= (1 << 24):
                     facs.append(m)
                 else:
                     rem_out *= m
@@ -4561,30 +4909,35 @@ def _sub_dag_new_nodes(
     ops_list: list[tuple[str, int, int, int]],
     active_defs: dict[int, tuple[str, int, int]],
     de: DictEngine,
+    *,
+    max_nodes: int = 1_000_000,
 ) -> Optional[dict[int, tuple[str, int, int]]]:
     """
     Resolve missing ancestors from `de` (dictionary) beyond `active_defs`.
-    Returns `{v: (op, a, b)}` of newly required nodes, or None if invalid/cyclic.
+    Returns `{v: (op, a, b)}` of newly required nodes, or None if invalid/cyclic/over limit.
     """
     added: dict[int, tuple[str, int, int]] = {}
     local_edges: dict[int, tuple[str, int, int]] = {}
     vl = de.vl
+    seeds = de.seeds_set
     for op, a, b, res in ops_list:
         if apply_op(op, a, b, vl) != res:
             return None
         local_edges[res] = (op, a, b)
 
-    seeds = de.seeds_set
-    seen = seeds | set(active_defs.keys())
     stk = [res for (_, _, _, res) in ops_list]
     for _, a, b, _ in ops_list:
-        stk.append(a)
-        stk.append(b)
+        if a not in seeds and a not in active_defs:
+            stk.append(a)
+        if b not in seeds and b not in active_defs:
+            stk.append(b)
 
     while stk:
         u = stk.pop()
-        if u in seen or u in added:
+        if u in seeds or u in active_defs or u in added:
             continue
+        if len(added) >= max_nodes:
+            return None
         if u in local_edges:
             op, a, b = local_edges[u]
         else:
@@ -4595,9 +4948,9 @@ def _sub_dag_new_nodes(
             if apply_op(op, a, b, vl) != u:
                 return None
         added[u] = (op, a, b)
-        if a not in seen and a not in added:
+        if a not in seeds and a not in active_defs and a not in added:
             stk.append(a)
-        if b not in seen and b not in added:
+        if b not in seeds and b not in active_defs and b not in added:
             stk.append(b)
 
     # Strict cycle check within `added`
@@ -4730,8 +5083,15 @@ def _precompute_smooth_bpe(
             raw_k.extend([s, -s])
 
     target_cands: dict[int, list[tuple[int, int, Counter[int], list[tuple[str, int, int, int]]]]] = defaultdict(list)
+    must_k = [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5] + [
+        kv for s in de.seeds for kv in (s, -s) if s > off_lim
+    ]
     for t in targets:
-        k_short = de.screen_smooth_offsets(t, raw_k, _SMALL_PRIMES, top_m=18)
+        screened = de.screen_smooth_offsets(t, raw_k, _SMALL_PRIMES, top_m=18)
+        k_short = list(must_k)
+        for kv in screened:
+            if kv not in must_k:
+                k_short.append(kv)
         cands = []
         seen_k = set()
         for k in k_short:
@@ -4751,7 +5111,14 @@ def _precompute_smooth_bpe(
             else:
                 dc = de.lookup_cost(rem)
                 rem_c = dc if dc < 99 else (rem.bit_length() // 3 + 3)
-            sc = len(facs) + rem_c + (0 if k == 0 else 1)
+            fac_c = 0
+            for fp in facs:
+                if fp <= 2000 or fp in de.seeds_set:
+                    fac_c += 1
+                else:
+                    dfc = de.lookup_cost(fp)
+                    fac_c += dfc if dfc < 99 else (fp.bit_length() // 3 + 3)
+            sc = fac_c + rem_c + (0 if k == 0 else 1)
             cands.append((sc, k, cand, facs, rem))
         if not cands:
             continue
@@ -4763,11 +5130,25 @@ def _precompute_smooth_bpe(
             ok = True
             for p, e in counts.items():
                 if not de.has(p) and p not in de.seeds_set:
-                    np = _naf_ops(p, vl, de.powers)
-                    if not np:
-                        ok = False
-                        break
-                    ops.extend(np)
+                    tp_p = de.two_pointer(p, K=3, fast=True) if p.bit_length() >= 14 else []
+                    got_p = False
+                    for d1p, d2p, pp, gp, sgp in tp_p:
+                        if gp == 0:
+                            ops.append(("*", d1p, d2p, pp))
+                            got_p = True
+                            break
+                        if gp in de.seeds_set or de.has(gp):
+                            if not de.has(pp):
+                                ops.append(("*", d1p, d2p, pp))
+                            ops.append(("+" if sgp == 1 else "-", pp, gp, p))
+                            got_p = True
+                            break
+                    if not got_p:
+                        np = _naf_ops(p, vl, de.powers)
+                        if not np:
+                            ok = False
+                            break
+                        ops.extend(np)
                 pe = p ** e
                 if pe > vl:
                     ok = False
@@ -4804,7 +5185,7 @@ def _precompute_smooth_bpe(
                 continue
             if rem > 1:
                 if not de.has(rem) and rem not in de.seeds_set:
-                    tp = de.two_pointer(rem, K=4)
+                    tp = de.two_pointer(rem, K=4, fast=True)
                     added_rem = False
                     for d1, d2, prod, gap, sgn in tp:
                         if gap == 0 or de.has(gap):
@@ -4910,8 +5291,9 @@ def _precompute_smooth_bpe(
 
 def _discover_latent_roots(targets: list[int], vl: int) -> list[int]:
     """
-    Discover hidden roots H where pairs satisfy A ≈ d*H, B ≈ n*H (2 <= d <= 32)
-    OR share nontrivial pairwise GCDs `gcd(A +- k1, B +- k2) > 100`.
+    Discover high-leverage shared roots H across ALL target pairs:
+      1. Common nontrivial GCDs `gcd(A +- k1, B +- k2) > 100` (weighted by bit-savings).
+      2. Gauss/CF rational multiples A ≈ d*H, B ≈ n*H (1 <= d, n <= 24).
     """
     roots: Counter[int] = Counter()
     ts = sorted(targets)
@@ -4919,33 +5301,43 @@ def _discover_latent_roots(targets: list[int], vl: int) -> list[int]:
     for i, A in enumerate(ts):
         if A <= 200:
             continue
-        for B in ts[i + 1 : min(n_t, i + 12)]:
+        for B in ts[i + 1 : n_t]:
             g0 = math.gcd(A, B)
             if 100 < g0 < A:
-                roots[g0] += 4
+                roots[g0] += max(4, g0.bit_length())
             for off_a in (-1, 0, 1):
                 for off_b in (-1, 0, 1):
                     if off_a == 0 and off_b == 0:
                         continue
                     ga = math.gcd(A + off_a, B + off_b)
                     if 100 < ga < A:
-                        roots[ga] += 2
-            for d in range(2, 33):
-                n = round(B * d / A)
-                if n <= d or math.gcd(n, d) != 1:
-                    continue
-                H = round(A / d)
-                if H <= 100 or d * H > vl or n * H > vl:
-                    continue
-                if abs(A - d * H) + abs(B - n * H) < max(2000, A // 2000):
-                    roots[H] += 1
-    return [h for h, _ in roots.most_common(10)]
+                        roots[ga] += max(2, ga.bit_length() // 2)
+            if B > A:
+                # Quick continued-fraction convergent check for n*A ≈ d*B
+                x, y = B, A
+                p0, p1 = 0, 1
+                q0, q1 = 1, 0
+                while y > 0:
+                    qt = x // y
+                    p2, q2 = qt * p1 + p0, qt * q1 + q0
+                    if q2 > 24:
+                        break
+                    p0, p1 = p1, p2
+                    q0, q1 = q1, q2
+                    x, y = y, x - qt * y
+                for n_c, d_c in ((p1, q1), (p0, q0)):
+                    if d_c >= 2 and n_c > d_c:
+                        H = round(A / d_c)
+                        if H > 100 and d_c * H <= vl and n_c * H <= vl:
+                            if abs(A - d_c * H) + abs(B - n_c * H) < max(5000, A // 1000):
+                                roots[H] += max(2, H.bit_length() // 4)
+    return [h for h, _ in roots.most_common(6)]
 
 
 def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
     """
     Minimum Spanning Arborescence over targets scored by exact pair-bridge costs:
-    |t_v - t_u| or t_v = q * t_u +- r, chained cleanly so related targets build adjacent.
+    |v - u|, q*u +- r, and rational (u // d)*q +- r, chaining related targets together.
     """
     if len(targets) <= 2:
         return sorted(targets, key=lambda x: (x.bit_length(), x))
@@ -4957,15 +5349,14 @@ def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
     for v in unvis:
         best_edge[v] = de.lookup_cost(v) if de.has(v) else (v.bit_length() // 3 + 3)
 
+    rat_divs = (2, 3, 4, 5, 6, 8, 9, 10, 12, 16)
     while unvis:
         u = order[-1]
         for v in unvis:
-            # 1. Additive delta |v - u|
             diff = abs(v - u)
             dc = (1 + de.lookup_cost(diff)) if diff > 0 else 0
             if dc < best_edge[v]:
                 best_edge[v] = dc
-            # 2. Quotient q*u +- r (when u < v)
             if 1 < u < v:
                 q = round(v / u)
                 if q >= 1 and q * u <= de.vl:
@@ -4974,6 +5365,18 @@ def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
                     rc = 0 if r == 0 else (1 + de.lookup_cost(r))
                     if qc + rc < best_edge[v]:
                         best_edge[v] = qc + rc
+            if u > 4:
+                for d in rat_divs:
+                    if u % d == 0 and de.has(d):
+                        base = u // d
+                        q = round(v / base)
+                        if 1 <= q <= 64 and q * base <= de.vl:
+                            r = abs(v - q * base)
+                            rc_q = 0 if q == 1 else (1 + de.lookup_cost(q))
+                            rc_r = 0 if r == 0 else (1 + de.lookup_cost(r))
+                            c_rat = 1 + de.lookup_cost(d) + rc_q + rc_r
+                            if c_rat < best_edge[v]:
+                                best_edge[v] = c_rat
         nxt = min(unvis, key=lambda v: (best_edge[v], v.bit_length(), v))
         order.append(nxt)
         unvis.remove(nxt)
@@ -5004,18 +5407,27 @@ def _synthesize_best_marginal(
         return {}
 
     best_added: Optional[dict[int, tuple[str, int, int]]] = None
+    best_ext: int = 10**9
 
     def consider_ops(ops_list: Optional[list[tuple[str, int, int, int]]]) -> None:
-        nonlocal best_added
+        nonlocal best_added, best_ext
         if not ops_list:
             return
-        nd = _sub_dag_new_nodes(ops_list, active_defs, de)
+        lim = 28 if recipe_collector is not None else (len(best_added) if best_added is not None else 1_000_000)
+        nd = _sub_dag_new_nodes(ops_list, active_defs, de, max_nodes=lim)
         if nd is None or (v not in nd and v not in active_defs and v not in seeds):
             return
-        if recipe_collector is not None and len(nd) <= 28:
+        n_nd = len(nd)
+        if recipe_collector is not None and n_nd <= 28:
             recipe_collector.append(nd)
-        if best_added is None or len(nd) < len(best_added):
+        if best_added is None or n_nd < len(best_added):
             best_added = nd
+            best_ext = sum(1 for _, (_, ax, bx) in nd.items() for x in (ax, bx) if x in active_defs)
+        elif n_nd == len(best_added):
+            ext = sum(1 for _, (_, ax, bx) in nd.items() for x in (ax, bx) if x in active_defs)
+            if ext < best_ext:
+                best_added = nd
+                best_ext = ext
 
     # 0. Direct dictionary lookup
     if de.has(v):
@@ -5070,7 +5482,10 @@ def _synthesize_best_marginal(
             consider_ops(ops)
 
     # 4. Multi-Radix Signed-Digit Horner (incl. powers-of-2 chunked bases 256, 1024, 65536) & NAF
-    for B in (16, 32, 64, 256, 1024, 65536, 10, 12, 100, 8):
+    if best_added is not None and len(best_added) <= 2 and recipe_collector is None:
+        return best_added
+    h_bases = (16, 32, 64, 256, 1024, 65536, 10, 12, 100, 8) if depth >= 1 else (16, 256, 65536)
+    for B in h_bases:
         if B < v and de.has(B):
             hops = _radix_horner_ops(v, B, de)
             if hops:
@@ -5101,7 +5516,7 @@ def _synthesize_best_marginal(
                 q_ok = (q == 1 or q in active_set or de.has(q))
                 qo = [] if q_ok else _naf_ops(q, vl, de.powers)
                 if not q_ok and not qo and depth >= 2 and q.bit_length() <= 32:
-                    tp_q = de.two_pointer(q, K=1)
+                    tp_q = de.two_pointer(q, K=1, fast=True)
                     if tp_q:
                         d1q, d2q, pq, gq, sgq = tp_q[0]
                         if gq == 0:
@@ -5126,59 +5541,87 @@ def _synthesize_best_marginal(
     if depth <= 0 or (best_added is not None and len(best_added) <= 2 and recipe_collector is None):
         return best_added
 
-    # 5. Active-node * D binary search (anchors cost 0!)
-    D_s = de.D_sorted
-    nD = len(D_s)
-    anchor_proposals = []
-    cand_anchors = [a for a in active_sorted if 1 < a < v and a not in de.powers]
-    if len(cand_anchors) > 25:
-        cand_anchors = cand_anchors[-25:]
-    for a in cand_anchors:
-        q_int = v // a
-        for qq in (q_int, q_int + 1):
-            if qq >= 1 and qq * a <= vl and (qq == 1 or de.has(qq) or qq <= 128):
-                prod = qq * a
-                anchor_proposals.append((abs(v - prod), a, qq, prod, "+" if v >= prod else "-"))
-        pos = bisect.bisect_left(D_s, q_int)
-        for off in (-1, 0, 1):
-            if 0 <= pos + off < nD:
-                qq = D_s[pos + off]
-                prod = a * qq
-                if 0 < prod <= vl:
-                    anchor_proposals.append((abs(v - prod), a, qq, prod, "+" if v >= prod else "-"))
-
-    anchor_proposals.sort(key=lambda x: x[0])
-    seen_prods: set[int] = set()
-    tried_ap = 0
-    for gap, a, qq, prod, sgn in anchor_proposals:
-        if prod in seen_prods:
-            continue
-        seen_prods.add(prod)
-        tried_ap += 1
-        if tried_ap > 4:
-            break
-        if qq == 1:
-            sub = []
-        elif de.has(qq):
-            sub = [("*", a, qq, prod)]
-        else:
-            qops = _naf_ops(qq, vl, de.powers)
-            if not qops:
+    # 5. Active-node * D via C99 full-pool anchor_scan + active rational bridges (a // d) * q +- r
+    if depth >= 2 or v.bit_length() >= 24:
+        anc_hits = de.anchor_scan(v, active_sorted, K=18)
+        seen_prods: set[int] = set()
+        tried_ap = 0
+        for _, gap, a, qq, prod, sgn_int in anc_hits:
+            if prod in seen_prods:
                 continue
-            sub = qops + [("*", a, qq, prod)]
-        if gap == 0:
-            consider_ops(sub)
-        elif gap in active_set or de.has(gap):
-            consider_ops(sub + [(sgn, prod, gap, v)])
-        elif depth >= 2:
-            res_depth = 1 if tried_ap <= 2 else 0
-            g_added = _synthesize_best_marginal(gap, active_defs, active_sorted, de, depth=res_depth)
-            if g_added is not None:
-                consider_ops(
-                    list(sub)
-                    + [(op, ax, bx, rx) for rx, (op, ax, bx) in g_added.items()]
-                    + [(sgn, prod, gap, v)]
-                )
+            seen_prods.add(prod)
+            tried_ap += 1
+            if tried_ap > 5:
+                break
+            sgn = "+" if sgn_int == 1 else "-"
+            if qq == 1:
+                sub = []
+            elif de.has(qq) or qq in active_set:
+                sub = [("*", a, qq, prod)] if prod not in active_set else []
+            else:
+                qops = _naf_ops(qq, vl, de.powers)
+                if not qops:
+                    continue
+                sub = qops + [("*", a, qq, prod)]
+            if gap == 0:
+                consider_ops(sub)
+            elif gap in active_set or de.has(gap):
+                consider_ops(sub + [(sgn, prod, gap, v)])
+            elif depth >= 2:
+                res_depth = 1 if tried_ap <= 2 else 0
+                g_added = _synthesize_best_marginal(gap, active_defs, active_sorted, de, depth=res_depth)
+                if g_added is not None:
+                    consider_ops(
+                        list(sub)
+                        + [(op, ax, bx, rx) for rx, (op, ax, bx) in g_added.items()]
+                        + [(sgn, prod, gap, v)]
+                    )
+
+    # 5b. Active-target rational bridges: v ≈ (a // d) * q +- r (top-level depth >= 2)
+    if depth >= 2 and v > 100 and active_sorted:
+        rat_cands: list[tuple[int, int, int, int, int, int, str]] = []
+        act_big = [a for a in active_sorted if a > 100 and a not in de.powers][-48:]
+        for a in act_big:
+            for d in (2, 3, 4, 5, 6, 8, 10, 12):
+                if a % d != 0 or not (d in active_set or de.has(d)):
+                    continue
+                base = a // d
+                if base <= 1:
+                    continue
+                q = round(v / base)
+                if q <= 0:
+                    q = 1
+                prod = base * q
+                if prod <= 0 or prod > vl:
+                    continue
+                if q == 1 or q <= 64 or q in active_set or de.has(q):
+                    gap = abs(v - prod)
+                    est = (0 if gap == 0 else gap.bit_length() // 3 + 3) + (0 if q == 1 else 2)
+                    rat_cands.append((est, gap, a, d, base, q, "+" if v >= prod else "-"))
+        rat_cands.sort(key=lambda x: (x[0], x[1]))
+        for _, gap, a, d, base, q, sgn in rat_cands[:3]:
+            sub_r: list[tuple[str, int, int, int]] = [] if base in active_set else [("/", a, d, base)]
+            prod = base * q
+            if q > 1:
+                if q not in active_set and not de.has(q):
+                    qops = _naf_ops(q, vl, de.powers)
+                    if not qops:
+                        continue
+                    sub_r.extend(qops)
+                if prod not in active_set:
+                    sub_r.append(("*", base, q, prod))
+            if gap == 0:
+                consider_ops(sub_r)
+            elif gap in active_set or de.has(gap):
+                consider_ops(sub_r + [(sgn, prod, gap, v)])
+            else:
+                g_added = _synthesize_best_marginal(gap, active_defs, active_sorted, de, depth=1)
+                if g_added is not None:
+                    consider_ops(
+                        list(sub_r)
+                        + [(op, ax, bx, rx) for rx, (op, ax, bx) in g_added.items()]
+                        + [(sgn, prod, gap, v)]
+                    )
 
     # 6. Scaled 20-bit multiplier split for >= 42-bit targets (top 6 fastest candidates!)
     if depth >= 2 and v.bit_length() >= 42 and de.split_muls:
@@ -5192,7 +5635,7 @@ def _synthesize_best_marginal(
             else:
                 sgn = "+"
             if q > 100:
-                tp_q = de.two_pointer(q, K=2)
+                tp_q = de.two_pointer(q, K=2, fast=True)
                 if tp_q:
                     d1q, d2q, pq, gq, sgq = tp_q[0]
                     q_cands.append((gq.bit_length() + r.bit_length(), m, q, r, sgn, tp_q[0]))
@@ -5257,7 +5700,7 @@ def _synthesize_best_marginal(
 
     # 8. Two-Pointer Product Residual (C99 or Python)
     if v > 100:
-        tp_hits = de.two_pointer(v, K=12)
+        tp_hits = de.two_pointer(v, K=16 if depth >= 2 else 6, fast=(depth <= 1))
         seen_tp: set[int] = set()
         tp_rec = 0
         for d1, d2, prod, gap, sgn in tp_hits:
@@ -5498,12 +5941,33 @@ def dag_synthesizer_solve(
         latent_roots = _discover_latent_roots(targets, de.vl)
         mst_order = _target_mst_order(targets, de)
 
-        orderings = [
-            latent_roots + sorted(targets, key=lambda t: (t.bit_length(), t)),
-            latent_roots + sorted(targets, key=lambda t: (0 if t in smooth_map else 1, t.bit_length(), t)),
-            latent_roots + mst_order,
-            latent_roots + sorted(targets, key=lambda t: (-t.bit_length(), t)),
+        base_orderings = [
+            sorted(targets, key=lambda t: (t.bit_length(), t)),
+            sorted(targets, key=lambda t: (0 if t in smooth_map else 1, t.bit_length(), t)),
+            mst_order,
+            sorted(targets, key=lambda t: (-t.bit_length(), t)),
         ]
+        orderings_true = list(base_orderings)
+        if latent_roots:
+            orderings_true.extend(latent_roots + o for o in base_orderings[:3])
+        orderings_false = list(base_orderings[:3])
+
+        def prune_dag(dmap: dict[int, tuple[str, int, int]], req: list[int] = targets) -> dict[int, tuple[str, int, int]]:
+            keep: dict[int, tuple[str, int, int]] = {}
+            stk = list(req)
+            vis = set(seeds_set)
+            while stk:
+                u = stk.pop()
+                if u in vis or u not in dmap:
+                    continue
+                vis.add(u)
+                op, a, b = dmap[u]
+                keep[u] = (op, a, b)
+                if a not in vis:
+                    stk.append(a)
+                if b not in vis:
+                    stk.append(b)
+            return keep
 
         has_univ = de.univ_ctx is not None
         univ_modes = (True, False) if has_univ else (True,)
@@ -5513,7 +5977,8 @@ def dag_synthesizer_solve(
 
         for allow_u in univ_modes:
             de.set_allow_univ(allow_u)
-            for order in orderings:
+            ords = orderings_true if allow_u else orderings_false
+            for order in ords:
                 active_defs: dict[int, tuple[str, int, int]] = {}
                 active_sorted = sorted(de.seeds)
                 active_set = set(active_sorted)
@@ -5535,15 +6000,16 @@ def dag_synthesizer_solve(
                         if n_bk:
                             added = _sub_dag_new_nodes(n_bk, active_defs, de)
                     if col:
-                        cand_recipes[item].extend(col[:5])
+                        cand_recipes[item].extend(col[:6])
                     if added:
                         active_defs.update(added)
                         active_set.update(added.keys())
                         active_sorted = sorted(active_set)
 
                 if all(t in active_defs or t in seeds_set for t in targets):
-                    if best_defs is None or len(active_defs) < len(best_defs):
-                        best_defs = active_defs
+                    pruned_act = prune_dag(active_defs)
+                    if best_defs is None or len(pruned_act) < len(best_defs):
+                        best_defs = pruned_act
                         best_univ = allow_u
 
         if best_defs is None:
@@ -5551,24 +6017,6 @@ def dag_synthesizer_solve(
             return binary_shared.solve(puzzle)
 
         de.set_allow_univ(best_univ)
-
-        def prune_dag(dmap: dict[int, tuple[str, int, int]], req: list[int] = targets) -> dict[int, tuple[str, int, int]]:
-            keep: dict[int, tuple[str, int, int]] = {}
-            stk = list(req)
-            vis = set(seeds_set)
-            while stk:
-                u = stk.pop()
-                if u in vis:
-                    continue
-                vis.add(u)
-                op, a, b = dmap[u]
-                keep[u] = (op, a, b)
-                if a not in vis:
-                    stk.append(a)
-                if b not in vis:
-                    stk.append(b)
-            return keep
-
         cur_defs = prune_dag(best_defs)
 
         # Single-target Monotone Rip-and-Reroute sweeps
@@ -5594,7 +6042,7 @@ def dag_synthesizer_solve(
                     recipe_collector=col_r,
                 )
                 if col_r:
-                    cand_recipes[t].extend(col_r[:4])
+                    cand_recipes[t].extend(col_r[:5])
                 if new_add is not None:
                     cand_defs = dict(keep_other)
                     cand_defs.update(new_add)
@@ -5622,9 +6070,12 @@ def dag_synthesizer_solve(
                 for x in seq_items:
                     if x in c_set:
                         continue
+                    col_p: list[dict[int, tuple[str, int, int]]] = [] if x in targets else None  # type: ignore[assignment]
                     add_x = _synthesize_best_marginal(
-                        x, c_defs, c_sorted, de, depth=2, extra_cands=smooth_map.get(x)
+                        x, c_defs, c_sorted, de, depth=2, extra_cands=smooth_map.get(x), recipe_collector=col_p
                     )
+                    if col_p:
+                        cand_recipes[x].extend(col_p[:4])
                     if add_x is None:
                         ok_pair = False
                         break
@@ -5636,7 +6087,103 @@ def dag_synthesizer_solve(
                     if len(c_pruned) < len(cur_defs):
                         cur_defs = c_pruned
 
-        n_trials = int(de.profile.get("compiler_trials", 48))
+        # Bridge-Releasing Subtree-Cluster Block-LNS (unlocks bridge targets frozen in single/pair Rip!)
+        if len(targets) >= 3:
+            val_users: dict[int, set[int]] = defaultdict(set)
+            for t in targets:
+                stk = [t]
+                vis = set(seeds_set)
+                while stk:
+                    u = stk.pop()
+                    if u in vis or u not in cur_defs:
+                        continue
+                    vis.add(u)
+                    val_users[u].add(t)
+                    _, pa, pb = cur_defs[u]
+                    stk.append(pa)
+                    stk.append(pb)
+
+            seen_clusters: set[frozenset[int]] = set()
+            cluster_cands: list[tuple[int, list[int]]] = []
+            for t in targets:
+                cl = val_users.get(t, {t})
+                if 2 <= len(cl) <= 5:
+                    fs = frozenset(cl)
+                    if fs not in seen_clusters:
+                        seen_clusters.add(fs)
+                        ko = prune_dag(cur_defs, [x for x in targets if x not in fs])
+                        cluster_cands.append((len(cur_defs) - len(ko), sorted(fs)))
+            for wi in range(min(len(ts_by_bits) - 2, 16)):
+                seed_win = {ts_by_bits[wi], ts_by_bits[wi + 1], ts_by_bits[wi + 2]}
+                exp_cl = set(seed_win)
+                for wt in seed_win:
+                    if len(val_users.get(wt, set())) <= 4:
+                        exp_cl.update(val_users.get(wt, set()))
+                if 2 <= len(exp_cl) <= 5:
+                    fs = frozenset(exp_cl)
+                    if fs not in seen_clusters:
+                        seen_clusters.add(fs)
+                        ko = prune_dag(cur_defs, [x for x in targets if x not in fs])
+                        cluster_cands.append((len(cur_defs) - len(ko), sorted(fs)))
+
+            cluster_cands.sort(key=lambda x: -x[0])
+            t_blk = time.monotonic()
+            for _, cl_list in cluster_cands[:16]:
+                if (time.monotonic() - t_blk) > 4.5:
+                    break
+                cl_set = set(cl_list)
+                keep_other = prune_dag(cur_defs, [x for x in targets if x not in cl_set])
+                if all(x in keep_other or x in seeds_set for x in cl_list):
+                    if len(keep_other) < len(cur_defs):
+                        cur_defs = keep_other
+                    continue
+                g_cl = 0
+                for ia in range(len(cl_list)):
+                    for ib in range(ia + 1, len(cl_list)):
+                        gv = math.gcd(cl_list[ia], cl_list[ib])
+                        if 100 < gv < min(cl_list) and gv > g_cl:
+                            g_cl = gv
+                cl_mst = _target_mst_order(cl_list, de)
+                cl_orders = [cl_list, list(reversed(cl_list)), cl_mst]
+                if g_cl > 100 and g_cl not in keep_other and g_cl not in seeds_set:
+                    cl_orders.append([g_cl] + cl_mst)
+                for ord_cl in cl_orders:
+                    c_defs = dict(keep_other)
+                    c_set = set(c_defs.keys()) | seeds_set
+                    c_sorted = sorted(c_set)
+                    ok_cl = True
+                    for x in ord_cl:
+                        if x in c_set:
+                            continue
+                        col_b: list[dict[int, tuple[str, int, int]]] = [] if x in cl_set else None  # type: ignore[assignment]
+                        add_x = _synthesize_best_marginal(
+                            x, c_defs, c_sorted, de, depth=2, extra_cands=smooth_map.get(x), recipe_collector=col_b
+                        )
+                        if col_b:
+                            cand_recipes[x].extend(col_b[:4])
+                        if add_x is None:
+                            ok_cl = False
+                            break
+                        c_defs.update(add_x)
+                        c_set.update(add_x.keys())
+                        c_sorted = sorted(c_set)
+                    if ok_cl and all(x in c_set for x in cl_list):
+                        c_pruned = prune_dag(c_defs)
+                        if len(c_pruned) < len(cur_defs):
+                            cur_defs = c_pruned
+
+        # Ensure standalone seed-rooted compact recipes exist in MILP pool for every target
+        seed_sorted = sorted(de.seeds)
+        for t in targets:
+            if len(cand_recipes[t]) < 4:
+                col_s: list[dict[int, tuple[str, int, int]]] = []
+                _synthesize_best_marginal(
+                    t, {}, seed_sorted, de, depth=2, extra_cands=smooth_map.get(t), recipe_collector=col_s
+                )
+                if col_s:
+                    cand_recipes[t].extend(col_s[:4])
+
+        n_trials = int(de.profile.get("compiler_trials", 64))
         best_prog = remove_dead_ops(puzzle, compile_dag(puzzle, cur_defs, n_trials=n_trials))
 
         # Bounded HiGHS MILP polish over union of compact recipes
@@ -5824,14 +6371,117 @@ def _live_shortcut_pass(puzzle: Puzzle, program: list[Instruction]) -> list[Inst
     return cur
 
 
+def _peephole_algebra_pass(puzzle: Puzzle, program: list[Instruction]) -> list[Instruction]:
+    """
+    Collapse adjacent constant/algebraic adjustment chains across live registers,
+    e.g., `(x + c1) + c2 -> x + c3` when `c3 = c1 + c2` (or inverse ops) already live.
+    """
+    if len(program) <= 2:
+        return program
+
+    cur = list(program)
+    n = len(cur)
+    targets = set(puzzle.targets)
+    regs: list[int | None] = [None] * puzzle.registers
+    for i, s in enumerate(puzzle.seeds):
+        regs[i] = s
+    targets_hit = set(puzzle.seeds) & targets
+
+    for i in range(n - 1):
+        ins_i = cur[i]
+        a = regs[ins_i.src1]
+        b = regs[ins_i.src2]
+        if a is None or b is None:
+            break
+        res_i = apply_op(ins_i.op, a, b, puzzle.value_limit)
+        if res_i is None:
+            break
+
+        need_target = (res_i in targets) and (res_i not in targets_hit)
+        # Simulate regs right after instruction i
+        regs_after = list(regs)
+        regs_after[ins_i.dst] = res_i
+        if not need_target and ins_i.src1 != ins_i.dst and ins_i.src2 != ins_i.dst:
+            val_to_reg: dict[int, int] = {}
+            for r_idx, rv in enumerate(regs_after):
+                if rv is not None and r_idx != ins_i.dst:
+                    val_to_reg[rv] = r_idx
+
+            # Check immediate next few instructions using ins_i.dst while src1/src2 remain intact
+            r_track = list(regs_after)
+            for j in range(i + 1, min(n, i + 8)):
+                ins_j = cur[j]
+                va = r_track[ins_j.src1]
+                vb = r_track[ins_j.src2]
+                if va is None or vb is None:
+                    break
+                res_j = apply_op(ins_j.op, va, vb, puzzle.value_limit)
+                if res_j is None:
+                    break
+
+                if ins_j.src1 == ins_i.dst or ins_j.src2 == ins_i.dst:
+                    other_r = ins_j.src2 if ins_j.src1 == ins_i.dst else ins_j.src1
+                    other_v = vb if ins_j.src1 == ins_i.dst else va
+                    # Case 1: direct identity shortcut `(a op c1) op2 c2 == a` (or another live reg!)
+                    if r_track[ins_i.src1] == a and res_j == a and ins_i.src1 != ins_i.dst:
+                        # Replace j with identity? Only if future reads of j's dst can use src1
+                        cand = list(cur)
+                        src_live = ins_i.src1
+                        ok_alias = True
+                        for k in range(j + 1, n):
+                            kn = cand[k]
+                            ns1 = src_live if kn.src1 == ins_j.dst else kn.src1
+                            ns2 = src_live if kn.src2 == ins_j.dst else kn.src2
+                            if ns1 != kn.src1 or ns2 != kn.src2:
+                                cand[k] = Instruction(kn.op, ns1, ns2, kn.dst)
+                            if cand[k].dst == ins_j.dst or cand[k].dst == src_live:
+                                break
+                        if ok_alias:
+                            cc = remove_dead_ops(puzzle, cand)
+                            if len(cc) < len(cur) and verify_program(puzzle, cc).valid:
+                                return _peephole_algebra_pass(puzzle, cc)
+
+                    # Case 2: `(a + b) + c2` or `(a - b) + c2` where `b +- c2` is already live
+                    if r_track[ins_i.src1] == a and ins_i.op in ("+", "-") and ins_j.op in ("+", "-") and ins_j.src1 == ins_i.dst:
+                        delta = (b if ins_i.op == "+" else -b) + (other_v if ins_j.op == "+" else -other_v)
+                        if delta != 0 and abs(delta) in val_to_reg and r_track[val_to_reg[abs(delta)]] == abs(delta):
+                            op_new = "+" if delta > 0 else "-"
+                            cand = list(cur)
+                            cand[j] = Instruction(op_new, ins_i.src1, val_to_reg[abs(delta)], ins_j.dst)
+                            cc = remove_dead_ops(puzzle, cand)
+                            if len(cc) < len(cur) and verify_program(puzzle, cc).valid:
+                                return _peephole_algebra_pass(puzzle, cc)
+
+                    # Case 3: `(a * b) * c2` where `b * c2` is already live
+                    if r_track[ins_i.src1] == a and ins_i.op == "*" and ins_j.op == "*":
+                        prod_bc = b * other_v
+                        if prod_bc in val_to_reg and r_track[val_to_reg[prod_bc]] == prod_bc:
+                            cand = list(cur)
+                            cand[j] = Instruction("*", ins_i.src1, val_to_reg[prod_bc], ins_j.dst)
+                            cc = remove_dead_ops(puzzle, cand)
+                            if len(cc) < len(cur) and verify_program(puzzle, cc).valid:
+                                return _peephole_algebra_pass(puzzle, cc)
+
+                r_track[ins_j.dst] = res_j
+                if ins_j.dst == ins_i.dst or ins_j.dst == ins_i.src1 or ins_j.dst == ins_i.src2:
+                    break
+
+        regs[ins_i.dst] = res_i
+        if res_i in targets:
+            targets_hit.add(res_i)
+
+    return cur
+
+
 def peephole(puzzle: Puzzle, program: list[Instruction]) -> list[Instruction]:
     """
     Apply local rewrites:
       1. Dead-op elimination (via remove_dead_ops).
-      2. Live-register value forwarding & redundant-computation pruning.
+      2. Live-register value forwarding & algebraic chain collapsing.
     """
     result = remove_dead_ops(puzzle, program)
     result = _live_shortcut_pass(puzzle, result)
+    result = _peephole_algebra_pass(puzzle, result)
     return result
 
 
@@ -6091,10 +6741,12 @@ def solve_puzzle(
             pass
 
     # --- C99 2-step Value-Set Beam Search (joint intermediate sharing for small/medium ranges) ---
-    if 40 <= puzzle.value_limit <= 25_000_000 and len(puzzle.targets) <= 15:
+    if 40 <= puzzle.value_limit and puzzle.targets and max(puzzle.targets) <= 25_000_000 and len(puzzle.targets) <= 15:
         try:
 # [bundled]             from src.solvers.fast_engine import solve_value_beam
-            vb_prog = solve_value_beam(puzzle)
+            vb_lim = min(puzzle.value_limit, max(25_000_000, max(puzzle.targets) * 4))
+            vb_puzzle = puzzle if vb_lim == puzzle.value_limit else Puzzle(puzzle.id, puzzle.seeds, puzzle.targets, vb_lim)
+            vb_prog = solve_value_beam(vb_puzzle, beam_w=160, max_steps=44)
             if vb_prog is not None and verify_program(puzzle, vb_prog).valid:
                 candidates.append(vb_prog)
         except Exception:

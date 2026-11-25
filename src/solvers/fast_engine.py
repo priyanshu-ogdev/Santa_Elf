@@ -116,39 +116,39 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
         eff_gb = max(avail_gb, 25.0) if (on_kaggle and total_gb >= 24.0) else avail_gb
 
     if eff_gb >= 22.0:
-        # Kaggle ~14-20 GB aggregate budget across 31.35 GB host:
+        # Kaggle ~13-19 GB aggregate budget across 31.35 GB host:
         #   U: 240M nodes x 16B (3.84 GB) + HT=2^30 x 4B (4.29 GB) = ~8.14 GB Read-Only CoW
-        #   + 4 workers x (36M local ~1.11 GB + 1.2M scan + MITM + beam + 5.5k MILP) ~ 6-10 GB
+        #   + 4 workers x (24M local ~652 MB + 10M radix-sorted scan ~90 MB + MITM + MILP) ~ 5-9 GB
         return {
             "mode": "kaggle_high_ram",
             "eff_gb": eff_gb,
             "univ_cap": 240_000_000,
             "univ_ht_pow": 30,
-            "local_cap": 36_000_000,
+            "local_cap": 24_000_000,
             "local_ht_pow": 26,
-            "local_scan": 1_200_000,
-            "per_bucket": 600_000,
-            "mitm_div_scan": 260_000,
+            "local_scan": 10_000_000,
+            "per_bucket": 500_000,
+            "mitm_div_scan": 420_000,
             "smooth_offset_lim": 256,
-            "milp_max_edges": 5500,
-            "milp_time": 2.0,
-            "compiler_trials": 64,
+            "milp_max_edges": 7000,
+            "milp_time": 2.5,
+            "compiler_trials": 120,
         }
     if eff_gb >= 14.0:
         return {
             "mode": "high_ram_16g",
             "eff_gb": eff_gb,
-            "univ_cap": 280_000_000,
+            "univ_cap": 240_000_000,
             "univ_ht_pow": 30,
             "local_cap": 4_000_000,
             "local_ht_pow": 24,
-            "local_scan": 600_000,
-            "per_bucket": 65_000,
-            "mitm_div_scan": 220_000,
+            "local_scan": 2_500_000,
+            "per_bucket": 75_000,
+            "mitm_div_scan": 260_000,
             "smooth_offset_lim": 200,
-            "milp_max_edges": 3000,
-            "milp_time": 1.5,
-            "compiler_trials": 48,
+            "milp_max_edges": 4000,
+            "milp_time": 1.8,
+            "compiler_trials": 80,
         }
     if eff_gb >= 6.5:
         return {
@@ -156,30 +156,30 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
             "eff_gb": eff_gb,
             "univ_cap": 60_000_000,
             "univ_ht_pow": 27,
-            "local_cap": 1_500_000,
+            "local_cap": 1_800_000,
             "local_ht_pow": 22,
-            "local_scan": 450_000,
-            "per_bucket": 25_000,
-            "mitm_div_scan": 180_000,
+            "local_scan": 1_200_000,
+            "per_bucket": 35_000,
+            "mitm_div_scan": 200_000,
             "smooth_offset_lim": 160,
-            "milp_max_edges": 2500,
-            "milp_time": 1.0,
-            "compiler_trials": 48,
+            "milp_max_edges": 3000,
+            "milp_time": 1.2,
+            "compiler_trials": 64,
         }
     return {
         "mode": "compact_ram",
         "eff_gb": eff_gb,
         "univ_cap": 8_000_000,
         "univ_ht_pow": 25,
-        "local_cap": 600_000,
+        "local_cap": 800_000,
         "local_ht_pow": 21,
-        "local_scan": 300_000,
-        "per_bucket": 10_000,
-        "mitm_div_scan": 150_000,
+        "local_scan": 800_000,
+        "per_bucket": 16_000,
+        "mitm_div_scan": 160_000,
         "smooth_offset_lim": 96,
-        "milp_max_edges": 1500,
-        "milp_time": 0.5,
-        "compiler_trials": 40,
+        "milp_max_edges": 2000,
+        "milp_time": 0.6,
+        "compiler_trials": 64,
     }
 
 
@@ -294,6 +294,30 @@ typedef struct { uint64_t v; uint8_t c; } SortPair;
 static int cmp_sp(const void *a, const void *b) {
     uint64_t va = ((const SortPair *)a)->v, vb = ((const SortPair *)b)->v;
     return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+}
+
+static void radix_sort_sp(SortPair *a, uint32_t n) {
+    if (n <= 1U) return;
+    if (n <= 2048U) { qsort(a, n, sizeof(SortPair), cmp_sp); return; }
+    SortPair *tmp = (SortPair *)malloc((size_t)n * sizeof(SortPair));
+    if (!tmp) { qsort(a, n, sizeof(SortPair), cmp_sp); return; }
+    SortPair *src = a, *dst = tmp;
+    uint32_t cnt[256], off[256];
+    for (int shift = 0; shift < 64; shift += 8) {
+        memset(cnt, 0, sizeof(cnt));
+        for (uint32_t i = 0; i < n; i++) cnt[(src[i].v >> shift) & 255U]++;
+        uint32_t fb = (uint32_t)((src[0].v >> shift) & 255U);
+        if (cnt[fb] == n) continue;
+        uint32_t sum = 0U;
+        for (int b = 0; b < 256; b++) { off[b] = sum; sum += cnt[b]; }
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t b = (uint32_t)((src[i].v >> shift) & 255U);
+            dst[off[b]++] = src[i];
+        }
+        SortPair *sw = src; src = dst; dst = sw;
+    }
+    if (src != a) memcpy(a, src, (size_t)n * sizeof(SortPair));
+    free(tmp);
 }
 
 static void free_bigdict(BigDict *d) {
@@ -563,8 +587,8 @@ EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow, int n_threads) {
         d->n = total_valid;
     }
 
-    /* Extract compact high-yield divisor array `scan_vals` (~300k items: 100k <=23b + 200k 24..34b) */
-    uint32_t max_udiv = 300000U;
+    /* Extract compact high-yield divisor array `scan_vals` (~1.2M items: 400k <=23b + 800k 24..34b) */
+    uint32_t max_udiv = 1200000U;
     d->scan_vals = (uint64_t *)malloc(sizeof(uint64_t) * max_udiv);
     d->scan_costs = (uint8_t *)malloc(sizeof(uint8_t) * max_udiv);
     if (d->scan_vals && d->scan_costs) {
@@ -573,16 +597,16 @@ EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow, int n_threads) {
             uint64_t v = d->vals[k];
             if (v <= 1ULL) continue;
             int bl = bl64(v);
-            if (bl <= 23 && cnt_lo < 100000U) {
+            if (bl <= 23 && cnt_lo < 400000U) {
                 d->scan_vals[out_u] = v;
                 d->scan_costs[out_u] = meta_cost(d->meta[k]);
                 cnt_lo++; out_u++;
-            } else if (bl >= 24 && bl <= 34 && cnt_mid < 200000U) {
+            } else if (bl >= 24 && bl <= 34 && cnt_mid < 800000U) {
                 d->scan_vals[out_u] = v;
                 d->scan_costs[out_u] = meta_cost(d->meta[k]);
                 cnt_mid++; out_u++;
             }
-            if (cnt_lo >= 100000U && cnt_mid >= 200000U) break;
+            if (cnt_lo >= 400000U && cnt_mid >= 800000U) break;
         }
         d->n_scan = out_u;
         d->alloc_bytes += (uint64_t)(sizeof(uint64_t) + sizeof(uint8_t)) * max_udiv;
@@ -621,6 +645,23 @@ EXPORT uint32_t fe_dict_copy_scan(void *p, uint64_t *out) {
     const BigDict *d = (const BigDict *)p;
     for (uint32_t i = 0; i < d->n_scan; i++) out[i] = d->scan_vals[i];
     return d->n_scan;
+}
+
+EXPORT uint32_t fe_dict_copy_scan_prefix(void *p, uint64_t *out, uint32_t max_n) {
+    const BigDict *d = (const BigDict *)p;
+    uint32_t n = d->n_scan;
+    if (n <= max_n) {
+        for (uint32_t i = 0; i < n; i++) out[i] = d->scan_vals[i];
+        return n;
+    }
+    uint32_t half = max_n / 2U;
+    for (uint32_t i = 0; i < half; i++) out[i] = d->scan_vals[i];
+    uint64_t rem_slots = max_n - half;
+    uint64_t avail = n - half;
+    for (uint64_t s = 0; s < rem_slots; s++) {
+        out[half + (uint32_t)s] = d->scan_vals[half + (uint32_t)((s * avail) / rem_slots)];
+    }
+    return max_n;
 }
 
 /*
@@ -783,7 +824,7 @@ EXPORT void* fe_local_create(
         }
     }
 
-    /* Build stratified sorted scan slice up to scan_cap */
+    /* Build cost-prioritized stratified sorted scan slice up to scan_cap via LSD Radix Sort */
     uint32_t ns_tot = d->n < scan_cap ? d->n : scan_cap;
     SortPair *sp = (SortPair *)malloc(sizeof(SortPair) * ns_tot);
     d->scan_vals  = (uint64_t *)malloc(sizeof(uint64_t) * ns_tot);
@@ -797,22 +838,55 @@ EXPORT void* fe_local_create(
                 filled++;
             }
         } else {
-            uint32_t keep_front = base_end < (ns_tot / 3) ? base_end : (ns_tot / 3);
-            for (uint32_t i = 0; i < keep_front; i++) {
-                sp[filled].v = d->vals[i];
-                sp[filled].c = meta_cost(d->meta[i]);
-                filled++;
-            }
-            uint64_t rem_slots = ns_tot - filled;
-            uint64_t avail = d->n - keep_front;
-            for (uint64_t s = 0; s < rem_slots && filled < ns_tot; s++) {
-                uint32_t idx = keep_front + (uint32_t)((s * avail) / rem_slots);
-                sp[filled].v = d->vals[idx];
-                sp[filled].c = meta_cost(d->meta[idx]);
-                filled++;
+            uint8_t *used = (uint8_t *)calloc((size_t)((d->n + 7U) >> 3), 1);
+            if (used) {
+                for (uint32_t i = 0; i < d->n && filled < ns_tot; i++) {
+                    uint8_t cc = meta_cost(d->meta[i]);
+                    if (cc <= 6) {
+                        sp[filled].v = d->vals[i];
+                        sp[filled].c = cc;
+                        filled++;
+                        used[i >> 3] |= (uint8_t)(1U << (i & 7U));
+                    }
+                }
+                uint32_t p2_cap = (ns_tot * 85U) / 100U;
+                if (filled < p2_cap) {
+                    for (uint32_t i = 0; i < d->n && filled < p2_cap; i++) {
+                        if (used[i >> 3] & (1U << (i & 7U))) continue;
+                        uint8_t cc = meta_cost(d->meta[i]);
+                        if (cc <= 8 && bl64(d->vals[i]) <= 38) {
+                            sp[filled].v = d->vals[i];
+                            sp[filled].c = cc;
+                            filled++;
+                            used[i >> 3] |= (uint8_t)(1U << (i & 7U));
+                        }
+                    }
+                }
+                if (filled < ns_tot) {
+                    uint64_t rem_slots = ns_tot - filled;
+                    uint64_t avail = d->n;
+                    for (uint64_t s = 0; s < rem_slots && filled < ns_tot; s++) {
+                        uint32_t idx = (uint32_t)((s * avail) / rem_slots);
+                        while (idx < d->n && (used[idx >> 3] & (1U << (idx & 7U)))) idx++;
+                        if (idx < d->n) {
+                            sp[filled].v = d->vals[idx];
+                            sp[filled].c = meta_cost(d->meta[idx]);
+                            filled++;
+                            used[idx >> 3] |= (uint8_t)(1U << (idx & 7U));
+                        }
+                    }
+                }
+                free(used);
+            } else {
+                for (uint64_t s = 0; s < ns_tot && filled < ns_tot; s++) {
+                    uint32_t idx = (uint32_t)((s * d->n) / ns_tot);
+                    sp[filled].v = d->vals[idx];
+                    sp[filled].c = meta_cost(d->meta[idx]);
+                    filled++;
+                }
             }
         }
-        qsort(sp, filled, sizeof(SortPair), cmp_sp);
+        radix_sort_sp(sp, filled);
         for (uint32_t i = 0; i < filled; i++) {
             d->scan_vals[i]  = sp[i].v;
             d->scan_costs[i] = sp[i].c;
@@ -827,11 +901,11 @@ EXPORT void* fe_local_create(
 typedef struct { uint64_t d1, d2, prod, gap; int32_t metric; uint8_t sgn; } Hit;
 
 /*
- * Fast O(N) Two-Pointer Scan with zero multi-GB DRAM misses:
- * Uses L3-resident `seen24` bitsets for instant ~1ns residual hit checks!
+ * Fast Bounded + Strided O(N/stride) Two-Pointer Scan:
+ * Binary-searches upper product bound and uses L3-resident `seen24` bitsets.
  */
-EXPORT int fe_two_pointer(
-    void *p_local, void *p_univ, uint64_t tgt, int K,
+EXPORT int fe_two_pointer_s(
+    void *p_local, void *p_univ, uint64_t tgt, int K, int stride,
     uint64_t *od1, uint64_t *od2, uint64_t *oprod, uint64_t *ogap, int *osgn
 ) {
     const BigDict *d = (const BigDict *)p_local;
@@ -839,6 +913,7 @@ EXPORT int fe_two_pointer(
     int N = (int)d->n_scan;
     if (N == 0) return 0;
     if (K > 64) K = 64;
+    if (stride < 1) stride = 1;
 
     Hit hits_gap[32]; int ng = 0, wg = 0;
     Hit hits_sc[32];  int ns = 0, ws = 0;
@@ -847,9 +922,18 @@ EXPORT int fe_two_pointer(
 
     const uint64_t *d_s24 = d->seen24;
     const uint64_t *u_s24 = u ? u->seen24 : NULL;
-    int i = 0, j = N - 1;
     u128 t128 = (u128)tgt;
     u128 vl128 = (u128)d->vl;
+
+    uint64_t a0 = d->scan_vals[0] > 0ULL ? d->scan_vals[0] : 1ULL;
+    u128 max_b128 = ((t128 * 2ULL) / (u128)a0) + 4096ULL;
+    int lo = 0, hi = N;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        if ((u128)d->scan_vals[mid] <= max_b128) lo = mid + 1;
+        else hi = mid;
+    }
+    int i = 0, j = (lo > 0) ? (lo - 1) : 0;
 
     while (i <= j) {
         uint64_t a = d->scan_vals[i], b = d->scan_vals[j];
@@ -887,8 +971,8 @@ EXPORT int fe_two_pointer(
                 }
             }
         }
-        if (prod < t128) i++;
-        else if (prod > t128) j--;
+        if (prod < t128) i += stride;
+        else if (prod > t128) j -= stride;
         else break;
     }
 
@@ -904,6 +988,121 @@ EXPORT int fe_two_pointer(
         out++;
     }
     return out;
+}
+
+EXPORT int fe_two_pointer(
+    void *p_local, void *p_univ, uint64_t tgt, int K,
+    uint64_t *od1, uint64_t *od2, uint64_t *oprod, uint64_t *ogap, int *osgn
+) {
+    return fe_two_pointer_s(p_local, p_univ, tgt, K, 1, od1, od2, oprod, ogap, osgn);
+}
+
+typedef struct { uint64_t a, qq, prod, gap; int32_t sc; uint8_t sgn; } AncHit;
+
+static inline int anc_gap_cost(const BigDict *d, const BigDict *u, uint64_t g) {
+    if (g == 0ULL) return 0;
+    if (g < (1ULL << 24)) {
+        if (d->seen24 && (d->seen24[g >> 6] & (1ULL << (g & 63)))) {
+            int32_t id = bd_find(d, g);
+            if (id >= 0) return (int)meta_cost(d->meta[id]) + 1;
+        }
+        if (u && u->seen24 && (u->seen24[g >> 6] & (1ULL << (g & 63)))) {
+            int32_t iu = bd_find(u, g);
+            if (iu >= 0) return (int)meta_cost(u->meta[iu]) + 3;
+        }
+    } else if (g < (1ULL << 38)) {
+        int32_t id = bd_find(d, g);
+        if (id >= 0) return (int)meta_cost(d->meta[id]) + 1;
+    }
+    return bl64(g) / 3 + 4;
+}
+
+static inline void anc_push(
+    AncHit *arr, int *n, int *w, int K, uint64_t a, uint64_t qq, uint64_t prod, uint64_t gap, int32_t sc, uint8_t sgn
+) {
+    if (*n < K) {
+        arr[*n] = (AncHit){a, qq, prod, gap, sc, sgn};
+        if (arr[*n].sc > arr[*w].sc) *w = *n;
+        (*n)++;
+    } else if (sc < arr[*w].sc) {
+        arr[*w] = (AncHit){a, qq, prod, gap, sc, sgn};
+        *w = 0;
+        for (int h = 1; h < *n; h++) if (arr[h].sc > arr[*w].sc) *w = h;
+    }
+}
+
+/*
+ * Fast C99 Active-Anchor Binary Search over ALL live DAG nodes (not truncated!),
+ * scoring proposals cleanly by true dict + gap bitset cost instead of raw magnitude.
+ */
+EXPORT int fe_anchor_scan(
+    void *p_local, void *p_univ, uint64_t tgt, uint64_t vl,
+    const uint64_t *act_vals, int n_act, int K,
+    uint64_t *oa, uint64_t *oq, uint64_t *oprod, uint64_t *ogap, int *osgn, int *osc
+) {
+    const BigDict *d = (const BigDict *)p_local;
+    const BigDict *u = (const BigDict *)p_univ;
+    if (!d || K <= 0) return 0;
+    if (K > 32) K = 32;
+    AncHit hits[32];
+    int nh = 0, wh = 0;
+    uint32_t nD = d->n_scan;
+
+    for (int i = 0; i < n_act; i++) {
+        uint64_t a = act_vals[i];
+        if (a <= 1ULL || a >= tgt || (a & (a - 1ULL)) == 0ULL) continue;
+        uint64_t q_int = tgt / a;
+
+        for (int pass = 0; pass < 2; pass++) {
+            uint64_t qq = q_int + (uint64_t)pass;
+            if (qq < 1ULL || (u128)a * (u128)qq > (u128)vl) continue;
+            int cq = -1;
+            if (qq == 1ULL) cq = 0;
+            else if (qq <= 256ULL) cq = bl64(qq) / 2 + 2;
+            else {
+                int32_t id = bd_find(d, qq);
+                if (id >= 0) cq = (int)meta_cost(d->meta[id]) + 1;
+                else if (u) {
+                    int32_t iu = bd_find(u, qq);
+                    if (iu >= 0) cq = (int)meta_cost(u->meta[iu]) + 3;
+                }
+            }
+            if (cq >= 0) {
+                uint64_t prod = a * qq;
+                uint64_t gap = (tgt >= prod) ? (tgt - prod) : (prod - tgt);
+                uint8_t sgn = (tgt >= prod) ? 1 : 0;
+                int32_t sc = cq + anc_gap_cost(d, u, gap) + (gap ? 1 : 0);
+                anc_push(hits, &nh, &wh, K, a, qq, prod, gap, sc, sgn);
+            }
+        }
+
+        if (nD > 0U) {
+            uint32_t lo = 0U, hi = nD;
+            while (lo < hi) {
+                uint32_t mid = lo + ((hi - lo) >> 1);
+                if (d->scan_vals[mid] < q_int) lo = mid + 1U;
+                else hi = mid;
+            }
+            for (int off = -1; off <= 1; off++) {
+                int64_t p = (int64_t)lo + off;
+                if (p >= 0 && p < (int64_t)nD) {
+                    uint64_t qq = d->scan_vals[p];
+                    if (qq == 0ULL || (u128)a * (u128)qq > (u128)vl) continue;
+                    uint64_t prod = a * qq;
+                    uint64_t gap = (tgt >= prod) ? (tgt - prod) : (prod - tgt);
+                    uint8_t sgn = (tgt >= prod) ? 1 : 0;
+                    int32_t sc = (int32_t)d->scan_costs[p] + 1 + anc_gap_cost(d, u, gap) + (gap ? 1 : 0);
+                    anc_push(hits, &nh, &wh, K, a, qq, prod, gap, sc, sgn);
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < nh; i++) {
+        oa[i] = hits[i].a; oq[i] = hits[i].qq; oprod[i] = hits[i].prod;
+        ogap[i] = hits[i].gap; osgn[i] = (int)hits[i].sgn; osc[i] = (int)hits[i].sc;
+    }
+    return nh;
 }
 
 typedef struct { uint64_t a, q, r; int32_t sc; uint8_t sgn; } MitmHit;
@@ -1523,11 +1722,11 @@ def get_clib() -> Optional[ctypes.CDLL]:
     try:
         ext = ".dll" if os.name == "nt" else ".so"
         tdir = tempfile.gettempdir()
-        so_path = os.path.join(tdir, f"santa2026_fast_engine_v8{ext}")
+        so_path = os.path.join(tdir, f"santa2026_fast_engine_v9{ext}")
         if not os.path.exists(so_path):
             pid = os.getpid()
-            c_path = os.path.join(tdir, f"santa2026_fast_engine_v8_{pid}.c")
-            tmp_so = os.path.join(tdir, f"santa2026_fast_engine_v8_{pid}{ext}")
+            c_path = os.path.join(tdir, f"santa2026_fast_engine_v9_{pid}.c")
+            tmp_so = os.path.join(tdir, f"santa2026_fast_engine_v9_{pid}{ext}")
             with open(c_path, "w", encoding="utf-8") as f:
                 f.write(_C_SOURCE)
             flags = ["gcc", "-O3", "-shared", "-fPIC"] + (["-static-libgcc"] if os.name == "nt" else ["-pthread"])
@@ -1583,6 +1782,10 @@ def get_clib() -> Optional[ctypes.CDLL]:
         ]
         lib.fe_dict_copy_scan.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
         lib.fe_dict_copy_scan.restype = ctypes.c_uint32
+        lib.fe_dict_copy_scan_prefix.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32
+        ]
+        lib.fe_dict_copy_scan_prefix.restype = ctypes.c_uint32
 
         lib.fe_two_pointer.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int,
@@ -1591,6 +1794,23 @@ def get_clib() -> Optional[ctypes.CDLL]:
             ctypes.POINTER(ctypes.c_int),
         ]
         lib.fe_two_pointer.restype = ctypes.c_int
+
+        lib.fe_two_pointer_s.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.fe_two_pointer_s.restype = ctypes.c_int
+
+        lib.fe_anchor_scan.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.fe_anchor_scan.restype = ctypes.c_int
 
         lib.fe_mitm_probe.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
@@ -1879,10 +2099,11 @@ class DictEngine:
         self._node_cache: dict[int, Optional[tuple[str, int, int]]] = {}
         self._has_cache: dict[int, bool] = {}
         self._cost_cache: dict[int, int] = {}
-        self._tp_cache: dict[int, list[tuple[int, int, int, int, int]]] = {}
+        self._tp_cache: dict[tuple[int, bool, bool], list[tuple[int, int, int, int, int]]] = {}
         self._mitm_cache: dict[tuple[int, bool], list[tuple[int, int, int, int, int]]] = {}
         self.ctx = None
         self.univ_ctx = None
+        self.c_scan_size = 0
         self.py_backend: Optional[_PyDictBackend] = None
 
         self.clib = None if force_python else get_clib()
@@ -1903,10 +2124,11 @@ class DictEngine:
 
             if self.ctx:
                 self.univ_ctx = _UNIV_CTX
-                ns = int(self.clib.fe_scan_size(self.ctx))
-                c_arr = (ctypes.c_uint64 * ns)()
-                self.clib.fe_dict_copy_scan(self.ctx, c_arr)
-                self.D_sorted = list(c_arr)
+                self.c_scan_size = int(self.clib.fe_scan_size(self.ctx))
+                py_ns = min(self.c_scan_size, 200_000)
+                c_arr = (ctypes.c_uint64 * py_ns)()
+                got = int(self.clib.fe_dict_copy_scan_prefix(self.ctx, c_arr, ctypes.c_uint32(py_ns)))
+                self.D_sorted = list(c_arr[:got])
             else:
                 self.clib = None
 
@@ -1943,7 +2165,6 @@ class DictEngine:
         self._node_cache.clear()
         self._has_cache.clear()
         self._cost_cache.clear()
-        self._tp_cache.clear()
         self.powers.clear()
         pw = 1
         while pw <= self.vl:
@@ -2044,24 +2265,82 @@ class DictEngine:
         self._node_cache[v] = res
         return res
 
-    def two_pointer(self, tgt: int, K: int = 14) -> list[tuple[int, int, int, int, int]]:
-        if tgt in self._tp_cache:
-            return self._tp_cache[tgt]
+    def two_pointer(
+        self, tgt: int, K: int = 16, *, fast: bool = False
+    ) -> list[tuple[int, int, int, int, int]]:
+        t_key = (tgt, self.univ_ctx is not None, fast)
+        if t_key in self._tp_cache:
+            return self._tp_cache[t_key]
         if self.py_backend is not None:
             res = self.py_backend.two_pointer(tgt, K=K)
-            self._tp_cache[tgt] = res
+            self._tp_cache[t_key] = res
             return res
+        stride = max(1, self.c_scan_size // 500_000) if fast else 1
         od1 = (ctypes.c_uint64 * K)()
         od2 = (ctypes.c_uint64 * K)()
         oprod = (ctypes.c_uint64 * K)()
         ogap = (ctypes.c_uint64 * K)()
         osgn = (ctypes.c_int * K)()
-        nh = self.clib.fe_two_pointer(
-            self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), K,
+        nh = self.clib.fe_two_pointer_s(
+            self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), K, stride,
             od1, od2, oprod, ogap, osgn
         )
         res = [(od1[i], od2[i], oprod[i], ogap[i], osgn[i]) for i in range(nh)]
-        self._tp_cache[tgt] = res
+        self._tp_cache[t_key] = res
+        return res
+
+    def anchor_scan(
+        self, tgt: int, active_vals: list[int], K: int = 16
+    ) -> list[tuple[int, int, int, int, int, int]]:
+        """
+        C99 binary search across ALL active DAG intermediates `a` against full `D_local` scan,
+        returning `(est_sc, gap, a, qq, prod, sgn)` sorted by lowest estimated cost.
+        """
+        if not active_vals or tgt <= 1:
+            return []
+        if self.py_backend is not None or self.ctx is None:
+            import bisect
+            D_s = self.D_sorted
+            nD = len(D_s)
+            hits: list[tuple[int, int, int, int, int, int]] = []
+            for a in active_vals:
+                if a <= 1 or a >= tgt or (a & (a - 1)) == 0:
+                    continue
+                qi = tgt // a
+                for qq in (qi, qi + 1):
+                    if qq >= 1 and a * qq <= self.vl and (qq <= 256 or self.has(qq)):
+                        prod = a * qq
+                        gap = abs(tgt - prod)
+                        sc = (0 if qq == 1 else self.lookup_cost(qq) + 1) + (
+                            0 if gap == 0 else (gap.bit_length() // 3 + 4)
+                        )
+                        hits.append((sc, gap, a, qq, prod, 1 if tgt >= prod else 0))
+                pos = bisect.bisect_left(D_s, qi)
+                for off in (-1, 0, 1):
+                    if 0 <= pos + off < nD:
+                        qq = D_s[pos + off]
+                        prod = a * qq
+                        if 0 < prod <= self.vl:
+                            gap = abs(tgt - prod)
+                            sc = 5 + (0 if gap == 0 else (gap.bit_length() // 3 + 4))
+                            hits.append((sc, gap, a, qq, prod, 1 if tgt >= prod else 0))
+            hits.sort(key=lambda x: (x[0], x[1]))
+            return hits[:K]
+
+        na = min(len(active_vals), 512)
+        act_arr = (ctypes.c_uint64 * na)(*active_vals[-na:])
+        oa = (ctypes.c_uint64 * K)()
+        oq = (ctypes.c_uint64 * K)()
+        oprod = (ctypes.c_uint64 * K)()
+        ogap = (ctypes.c_uint64 * K)()
+        osgn = (ctypes.c_int * K)()
+        osc = (ctypes.c_int * K)()
+        nh = self.clib.fe_anchor_scan(
+            self.ctx, self.univ_ctx, ctypes.c_uint64(tgt), ctypes.c_uint64(self.vl),
+            act_arr, na, K, oa, oq, oprod, ogap, osgn, osc
+        )
+        res = [(osc[i], ogap[i], oa[i], oq[i], oprod[i], osgn[i]) for i in range(nh)]
+        res.sort(key=lambda x: (x[0], x[1]))
         return res
 
     def mitm_probe(

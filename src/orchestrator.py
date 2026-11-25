@@ -127,10 +127,12 @@ def solve_puzzle(
             pass
 
     # --- C99 2-step Value-Set Beam Search (joint intermediate sharing for small/medium ranges) ---
-    if 40 <= puzzle.value_limit <= 25_000_000 and len(puzzle.targets) <= 15:
+    if 40 <= puzzle.value_limit and puzzle.targets and max(puzzle.targets) <= 25_000_000 and len(puzzle.targets) <= 15:
         try:
             from src.solvers.fast_engine import solve_value_beam
-            vb_prog = solve_value_beam(puzzle)
+            vb_lim = min(puzzle.value_limit, max(25_000_000, max(puzzle.targets) * 4))
+            vb_puzzle = puzzle if vb_lim == puzzle.value_limit else Puzzle(puzzle.id, puzzle.seeds, puzzle.targets, vb_lim)
+            vb_prog = solve_value_beam(vb_puzzle, beam_w=160, max_steps=44)
             if vb_prog is not None and verify_program(puzzle, vb_prog).valid:
                 candidates.append(vb_prog)
         except Exception:

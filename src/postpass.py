@@ -146,14 +146,117 @@ def _live_shortcut_pass(puzzle: Puzzle, program: list[Instruction]) -> list[Inst
     return cur
 
 
+def _peephole_algebra_pass(puzzle: Puzzle, program: list[Instruction]) -> list[Instruction]:
+    """
+    Collapse adjacent constant/algebraic adjustment chains across live registers,
+    e.g., `(x + c1) + c2 -> x + c3` when `c3 = c1 + c2` (or inverse ops) already live.
+    """
+    if len(program) <= 2:
+        return program
+
+    cur = list(program)
+    n = len(cur)
+    targets = set(puzzle.targets)
+    regs: list[int | None] = [None] * puzzle.registers
+    for i, s in enumerate(puzzle.seeds):
+        regs[i] = s
+    targets_hit = set(puzzle.seeds) & targets
+
+    for i in range(n - 1):
+        ins_i = cur[i]
+        a = regs[ins_i.src1]
+        b = regs[ins_i.src2]
+        if a is None or b is None:
+            break
+        res_i = apply_op(ins_i.op, a, b, puzzle.value_limit)
+        if res_i is None:
+            break
+
+        need_target = (res_i in targets) and (res_i not in targets_hit)
+        # Simulate regs right after instruction i
+        regs_after = list(regs)
+        regs_after[ins_i.dst] = res_i
+        if not need_target and ins_i.src1 != ins_i.dst and ins_i.src2 != ins_i.dst:
+            val_to_reg: dict[int, int] = {}
+            for r_idx, rv in enumerate(regs_after):
+                if rv is not None and r_idx != ins_i.dst:
+                    val_to_reg[rv] = r_idx
+
+            # Check immediate next few instructions using ins_i.dst while src1/src2 remain intact
+            r_track = list(regs_after)
+            for j in range(i + 1, min(n, i + 8)):
+                ins_j = cur[j]
+                va = r_track[ins_j.src1]
+                vb = r_track[ins_j.src2]
+                if va is None or vb is None:
+                    break
+                res_j = apply_op(ins_j.op, va, vb, puzzle.value_limit)
+                if res_j is None:
+                    break
+
+                if ins_j.src1 == ins_i.dst or ins_j.src2 == ins_i.dst:
+                    other_r = ins_j.src2 if ins_j.src1 == ins_i.dst else ins_j.src1
+                    other_v = vb if ins_j.src1 == ins_i.dst else va
+                    # Case 1: direct identity shortcut `(a op c1) op2 c2 == a` (or another live reg!)
+                    if r_track[ins_i.src1] == a and res_j == a and ins_i.src1 != ins_i.dst:
+                        # Replace j with identity? Only if future reads of j's dst can use src1
+                        cand = list(cur)
+                        src_live = ins_i.src1
+                        ok_alias = True
+                        for k in range(j + 1, n):
+                            kn = cand[k]
+                            ns1 = src_live if kn.src1 == ins_j.dst else kn.src1
+                            ns2 = src_live if kn.src2 == ins_j.dst else kn.src2
+                            if ns1 != kn.src1 or ns2 != kn.src2:
+                                cand[k] = Instruction(kn.op, ns1, ns2, kn.dst)
+                            if cand[k].dst == ins_j.dst or cand[k].dst == src_live:
+                                break
+                        if ok_alias:
+                            cc = remove_dead_ops(puzzle, cand)
+                            if len(cc) < len(cur) and verify_program(puzzle, cc).valid:
+                                return _peephole_algebra_pass(puzzle, cc)
+
+                    # Case 2: `(a + b) + c2` or `(a - b) + c2` where `b +- c2` is already live
+                    if r_track[ins_i.src1] == a and ins_i.op in ("+", "-") and ins_j.op in ("+", "-") and ins_j.src1 == ins_i.dst:
+                        delta = (b if ins_i.op == "+" else -b) + (other_v if ins_j.op == "+" else -other_v)
+                        if delta != 0 and abs(delta) in val_to_reg and r_track[val_to_reg[abs(delta)]] == abs(delta):
+                            op_new = "+" if delta > 0 else "-"
+                            cand = list(cur)
+                            cand[j] = Instruction(op_new, ins_i.src1, val_to_reg[abs(delta)], ins_j.dst)
+                            cc = remove_dead_ops(puzzle, cand)
+                            if len(cc) < len(cur) and verify_program(puzzle, cc).valid:
+                                return _peephole_algebra_pass(puzzle, cc)
+
+                    # Case 3: `(a * b) * c2` where `b * c2` is already live
+                    if r_track[ins_i.src1] == a and ins_i.op == "*" and ins_j.op == "*":
+                        prod_bc = b * other_v
+                        if prod_bc in val_to_reg and r_track[val_to_reg[prod_bc]] == prod_bc:
+                            cand = list(cur)
+                            cand[j] = Instruction("*", ins_i.src1, val_to_reg[prod_bc], ins_j.dst)
+                            cc = remove_dead_ops(puzzle, cand)
+                            if len(cc) < len(cur) and verify_program(puzzle, cc).valid:
+                                return _peephole_algebra_pass(puzzle, cc)
+
+                r_track[ins_j.dst] = res_j
+                if ins_j.dst == ins_i.dst or ins_j.dst == ins_i.src1 or ins_j.dst == ins_i.src2:
+                    break
+
+        regs[ins_i.dst] = res_i
+        if res_i in targets:
+            targets_hit.add(res_i)
+
+    return cur
+
+
 def peephole(puzzle: Puzzle, program: list[Instruction]) -> list[Instruction]:
     """
     Apply local rewrites:
       1. Dead-op elimination (via remove_dead_ops).
-      2. Live-register value forwarding & redundant-computation pruning.
+      2. Live-register value forwarding & algebraic chain collapsing.
     """
     result = remove_dead_ops(puzzle, program)
     result = _live_shortcut_pass(puzzle, result)
+    result = _peephole_algebra_pass(puzzle, result)
     return result
 
 
