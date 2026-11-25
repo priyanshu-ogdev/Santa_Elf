@@ -126,6 +126,16 @@ def solve_puzzle(
         except Exception:
             pass
 
+    # --- C99 2-step Value-Set Beam Search (joint intermediate sharing for small/medium ranges) ---
+    if 40 <= puzzle.value_limit <= 25_000_000 and len(puzzle.targets) <= 15:
+        try:
+            from src.solvers.fast_engine import solve_value_beam
+            vb_prog = solve_value_beam(puzzle)
+            if vb_prog is not None and verify_program(puzzle, vb_prog).valid:
+                candidates.append(vb_prog)
+        except Exception:
+            pass
+
     # --- binary_shared (secondary wNAF ensemble — fast baseline) ---
     try:
         prog = binary_shared.solve(puzzle)

@@ -1,20 +1,22 @@
 """
 src/solvers/fast_engine.py
-V6 High-RAM 4-Thread Sharded 128-bit Universal + Local Dictionary & C99 MITM Engine.
+V8 High-RAM 4-Thread Sharded 128-bit Universal + Local Dictionary, C99 MITM,
+and 64-bit Value-Set Beam Engine.
 
 Key Engineering & Speed Upgrades:
   1. 4-Thread Lock-Free 64-Shard Universal `{1}`-Dictionary (`U`):
      Uses 64 hash shards (`(hash64(v) >> 58) & 63`) so all 4 CPU threads populate
      independent shards + disjoint value slices with zero locks/atomics (~6 M nodes/s).
-     On Kaggle (~29-30 GB RAM), builds up to `500,000,000` packed 16-byte nodes +
-     `2^31` 4-byte hash slots (`~16.59 GB` Read-Only Copy-on-Write across all 4 workers).
+     On Kaggle (~30-31 GB RAM), builds `240,000,000` packed 16-byte nodes + `2^30`
+     4-byte hash slots (`~8.14 GB` Read-Only Copy-on-Write across all 4 workers),
+     freeing per-worker RAM & cache bandwidth for `D_local = 36,000,000`.
   2. Zero-Stall `two_pointer` L3 Bitset:
      Retains the `2 MiB` `seen24` (`< 2^24`) bitset so `fe_two_pointer` evaluates
      gap reachability in ~1ns in L3 cache instead of missing DRAM in a multi-GB HT.
-  3. High-Yield Divisor Slice (`u->scan_vals`):
+  3. High-Yield Divisor Slice (`u->scan_vals`) & `< 2^28` MITM Near-Misses:
      Caches balanced `< 2^20` + `24..34`-bit divisors in `U` for targeted MITM probing.
-  4. Fast Per-Worker `D_local` (`fe_local_create`):
-     Capped Layer 2/3 (`Phase A` base cross) builds 10M seed-derived nodes in ~1-2s.
+  4. C99 64-bit 2-Step Value-Set Beam Search (`fe_value_beam64`):
+     Explores joint shared intermediates across small/medium targets (`vl <= 25M`).
 """
 from __future__ import annotations
 import ctypes
@@ -23,7 +25,7 @@ import shutil
 import subprocess
 import tempfile
 from typing import Optional
-from src.utils import Puzzle
+from src.utils import Puzzle, Instruction
 
 
 # ---------------------------------------------------------------------------
@@ -114,19 +116,19 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
         eff_gb = max(avail_gb, 25.0) if (on_kaggle and total_gb >= 24.0) else avail_gb
 
     if eff_gb >= 22.0:
-        # Kaggle ~20-25 GB aggregate budget:
-        #   U: 360M nodes x 16B (5.76 GB) + HT=2^31 x 4B (8.59 GB) = 14.35 GB Read-Only CoW
-        #   + 4 workers x (26M local ~690 MB + 1M scan + MITM + 5.5k MILP/Python) ~ 5-8 GB
+        # Kaggle ~14-20 GB aggregate budget across 31.35 GB host:
+        #   U: 240M nodes x 16B (3.84 GB) + HT=2^30 x 4B (4.29 GB) = ~8.14 GB Read-Only CoW
+        #   + 4 workers x (36M local ~1.11 GB + 1.2M scan + MITM + beam + 5.5k MILP) ~ 6-10 GB
         return {
             "mode": "kaggle_high_ram",
             "eff_gb": eff_gb,
-            "univ_cap": 360_000_000,
-            "univ_ht_pow": 31,
-            "local_cap": 26_000_000,
+            "univ_cap": 240_000_000,
+            "univ_ht_pow": 30,
+            "local_cap": 36_000_000,
             "local_ht_pow": 26,
-            "local_scan": 1_000_000,
-            "per_bucket": 450_000,
-            "mitm_div_scan": 240_000,
+            "local_scan": 1_200_000,
+            "per_bucket": 600_000,
+            "mitm_div_scan": 260_000,
             "smooth_offset_lim": 256,
             "milp_max_edges": 5500,
             "milp_time": 2.0,
@@ -960,8 +962,8 @@ EXPORT int fe_mitm_probe(
                     int cr = lookup_cost_both(d, u, r); \
                     if (cr >= 0) { \
                         mitm_push(hits, &nh, &wh, K, a_v, q, r, ca_v + cq + cr + 2, 1); \
-                    } else if (r < (1ULL << 22)) { \
-                        mitm_push(hits, &nh, &wh, K, a_v, q, r, ca_v + cq + (bl64(r) / 3) + 4, 1); \
+                    } else if (r < (1ULL << 28)) { \
+                        mitm_push(hits, &nh, &wh, K, a_v, q, r, ca_v + cq + (bl64(r) / 3) + 5, 1); \
                     } \
                 } \
             } \
@@ -972,8 +974,8 @@ EXPORT int fe_mitm_probe(
                     int cr2 = lookup_cost_both(d, u, r2); \
                     if (cr2 >= 0) { \
                         mitm_push(hits, &nh, &wh, K, a_v, q + 1ULL, r2, ca_v + cq1 + cr2 + 2, 0); \
-                    } else if (r2 < (1ULL << 22)) { \
-                        mitm_push(hits, &nh, &wh, K, a_v, q + 1ULL, r2, ca_v + cq1 + (bl64(r2) / 3) + 4, 0); \
+                    } else if (r2 < (1ULL << 28)) { \
+                        mitm_push(hits, &nh, &wh, K, a_v, q + 1ULL, r2, ca_v + cq1 + (bl64(r2) / 3) + 5, 0); \
                     } \
                 } \
             } \
@@ -1038,6 +1040,463 @@ EXPORT void fe_screen_smooth(
         out_sc[i] = facs + (rb > 0 ? (rb / 3 + 2) : 0) + (k == 0 ? 0 : 1);
     }
 }
+
+#define VB_MAX_POOL 96
+#define VB_K_CHILD  32
+#define VB_SEEN_HT  32768U
+#define VB_SET_HT   65536U
+
+typedef struct {
+    int32_t parent;
+    uint8_t op;
+    uint64_t a, b, r;
+} VBHist;
+
+typedef struct {
+    uint64_t vals[VB_MAX_POOL];
+    uint32_t rem_mask;
+    int32_t nv;
+    int32_t hist_id;
+} VBState;
+
+typedef struct {
+    uint64_t need;
+    uint8_t ti;
+} VBReq;
+
+typedef struct {
+    uint64_t x, a, b;
+    uint8_t op;
+    int32_t quick_sc;
+    uint32_t dmask;
+    uint32_t umask;
+} VBChild;
+
+typedef struct {
+    uint64_t x, a, b;
+    uint8_t op;
+    int32_t p_idx;
+    uint32_t new_rem;
+    double score;
+} VBCandNext;
+
+static int vb_cmp_u64(const void *a, const void *b) {
+    uint64_t va = *(const uint64_t *)a, vb = *(const uint64_t *)b;
+    return (va < vb) ? -1 : (va > vb) ? 1 : 0;
+}
+
+static int vb_cmp_req(const void *a, const void *b) {
+    const VBReq *ra = (const VBReq *)a, *rb = (const VBReq *)b;
+    if (ra->need < rb->need) return -1;
+    if (ra->need > rb->need) return 1;
+    return (int)ra->ti - (int)rb->ti;
+}
+
+static int vb_cmp_next(const void *a, const void *b) {
+    const VBCandNext *ca = (const VBCandNext *)a, *cb = (const VBCandNext *)b;
+    if (ca->score < cb->score) return -1;
+    if (ca->score > cb->score) return 1;
+    return (ca->x < cb->x) ? -1 : (ca->x > cb->x) ? 1 : 0;
+}
+
+static inline uint64_t vb_isqrt64(uint64_t n) {
+    if (n <= 1ULL) return n;
+    int s = bl64(n);
+    uint64_t x = 1ULL << ((s + 1) >> 1);
+    for (;;) {
+        uint64_t y = (x + n / x) >> 1;
+        if (y >= x) return x;
+        x = y;
+    }
+}
+
+static inline int vb_lb_u64(const uint64_t *arr, int n, uint64_t key) {
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        if (arr[mid] < key) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static inline int vb_lb_req(const VBReq *arr, int n, uint64_t key) {
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        if (arr[mid].need < key) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+static inline uint64_t vb_nearest_diff_u64(const uint64_t *sv, int nv, uint64_t key) {
+    int pos = vb_lb_u64(sv, nv, key);
+    uint64_t best = UINT64_MAX;
+    if (pos < nv) {
+        uint64_t d = sv[pos] - key;
+        if (d < best) best = d;
+    }
+    if (pos > 0) {
+        uint64_t d = key - sv[pos - 1];
+        if (d < best) best = d;
+    }
+    return best;
+}
+
+static inline uint64_t vb_eval_gap_sv(uint64_t t, uint64_t x, const uint64_t *sv, int nv, uint64_t vl) {
+    uint64_t best = (t > x) ? (t - x) : (x - t);
+    uint64_t d;
+    if (t > x) {
+        d = vb_nearest_diff_u64(sv, nv, t - x);
+        if (d < best) best = d;
+    } else if (x > t) {
+        d = vb_nearest_diff_u64(sv, nv, x - t);
+        if (d < best) best = d;
+    }
+    if (x <= vl - t) {
+        d = vb_nearest_diff_u64(sv, nv, t + x);
+        if (d < best) best = d;
+    }
+    if (x > 0ULL) {
+        uint64_t q = t / x;
+        int pos = vb_lb_u64(sv, nv, q);
+        for (int off = -1; off <= 1; off++) {
+            int p = pos + off;
+            if (p >= 0 && p < nv) {
+                u128 prod = (u128)x * (u128)sv[p];
+                if (prod <= (u128)vl) {
+                    uint64_t pv = (uint64_t)prod;
+                    d = (t > pv) ? (t - pv) : (pv - t);
+                    if (d < best) best = d;
+                }
+            }
+        }
+    }
+    if (t > 0ULL && x > t) {
+        uint64_t q = x / t;
+        int pos = vb_lb_u64(sv, nv, q);
+        for (int off = -1; off <= 1; off++) {
+            int p = pos + off;
+            if (p >= 0 && p < nv && sv[p] > 1ULL) {
+                uint64_t qv = x / sv[p];
+                d = (t > qv) ? (t - qv) : (qv - t);
+                if (d < best) best = d;
+            }
+        }
+    }
+    if (x + x <= vl) {
+        uint64_t x2 = x + x;
+        d = (t > x2) ? (t - x2) : (x2 - t);
+        if (d < best) best = d;
+    }
+    if (x > 1ULL && (u128)x * (u128)x <= (u128)vl) {
+        uint64_t xx = x * x;
+        d = (t > xx) ? (t - xx) : (xx - t);
+        if (d < best) best = d;
+    }
+    return best ? best : 1ULL;
+}
+
+static inline uint64_t vb_hash_arr(const uint64_t *arr, int n) {
+    uint64_t h = 0x9e3779b97f4a7c15ULL ^ (uint64_t)n;
+    for (int i = 0; i < n; i++) {
+        h ^= hash64(arr[i] + 0x517cc1b727220a95ULL * (uint64_t)(i + 1));
+        h = (h << 13) | (h >> 51);
+        h *= 0xbf58476d1ce4e5b9ULL;
+    }
+    return h ? h : 1ULL;
+}
+
+/*
+ * C99 64-bit 2-step lookahead Value-Set Beam Search:
+ * Discovers non-trivial shared intermediate registers across multiple targets.
+ * Returns number of emitted instructions (>0 on success, 0 if unsolved).
+ */
+EXPORT int fe_value_beam64(
+    const uint64_t *seeds, int n_seeds,
+    const uint64_t *targets, int n_targets,
+    uint64_t vl, int beam_w, int max_steps,
+    uint8_t *out_op, uint64_t *out_a, uint64_t *out_b, uint64_t *out_r
+) {
+    if (n_seeds <= 0 || n_targets <= 0 || n_targets > 31) return 0;
+    if (n_seeds >= VB_MAX_POOL - 1 || beam_w <= 0 || max_steps <= 0) return 0;
+    if (n_seeds + max_steps > VB_MAX_POOL) max_steps = VB_MAX_POOL - n_seeds;
+    if (beam_w > 512) beam_w = 512;
+
+    int ret = 0;
+    int max_hist = beam_w * (max_steps + 1) + 64;
+    int max_cand_next = beam_w * VB_K_CHILD + 32;
+    int req_cap = n_targets * (5 * VB_MAX_POOL + 8);
+
+    VBState *cur = (VBState *)calloc((size_t)beam_w, sizeof(VBState));
+    VBState *nxt = (VBState *)calloc((size_t)beam_w, sizeof(VBState));
+    VBHist *hist = (VBHist *)malloc((size_t)max_hist * sizeof(VBHist));
+    VBCandNext *cand_next = (VBCandNext *)malloc((size_t)max_cand_next * sizeof(VBCandNext));
+    VBReq *reqs = (VBReq *)malloc((size_t)req_cap * sizeof(VBReq));
+    uint64_t *seen_k = (uint64_t *)calloc(VB_SEEN_HT, sizeof(uint64_t));
+    uint32_t *seen_g = (uint32_t *)calloc(VB_SEEN_HT, sizeof(uint32_t));
+    int32_t *g_ht = (int32_t *)malloc(VB_SET_HT * sizeof(int32_t));
+    uint64_t *nxt_sorted = (uint64_t *)malloc((size_t)beam_w * VB_MAX_POOL * sizeof(uint64_t));
+    if (!cur || !nxt || !hist || !cand_next || !reqs || !seen_k || !seen_g || !g_ht || !nxt_sorted) {
+        goto cleanup;
+    }
+
+    uint32_t init_rem = (1U << n_targets) - 1U;
+    cur[0].nv = n_seeds;
+    cur[0].hist_id = -1;
+    for (int i = 0; i < n_seeds; i++) cur[0].vals[i] = seeds[i];
+    for (int ti = 0; ti < n_targets; ti++) {
+        for (int i = 0; i < n_seeds; i++) {
+            if (seeds[i] == targets[ti]) init_rem &= ~(1U << ti);
+        }
+    }
+    if (init_rem == 0U) { ret = 0; goto cleanup; }
+    cur[0].rem_mask = init_rem;
+
+    int n_cur = 1;
+    int n_hist = 0;
+    uint32_t gen = 1U;
+
+    for (int step = 0; step < max_steps; step++) {
+        int n_cnext = 0;
+        for (int si = 0; si < n_cur; si++) {
+            const VBState *st = &cur[si];
+            int nv = st->nv;
+            if (nv >= VB_MAX_POOL) continue;
+
+            uint64_t sv[VB_MAX_POOL];
+            memcpy(sv, st->vals, (size_t)nv * sizeof(uint64_t));
+            qsort(sv, (size_t)nv, sizeof(uint64_t), vb_cmp_u64);
+
+            uint64_t rem_t[32];
+            uint8_t rem_ti[32];
+            int nr = 0;
+            for (int ti = 0; ti < n_targets; ti++) {
+                if (st->rem_mask & (1U << ti)) {
+                    rem_t[nr] = targets[ti];
+                    rem_ti[nr] = (uint8_t)ti;
+                    nr++;
+                }
+            }
+            if (nr == 0) continue;
+
+            gen++;
+            for (int i = 0; i < nv; i++) {
+                uint32_t h = (uint32_t)hash64(sv[i]) & (VB_SEEN_HT - 1U);
+                while (seen_g[h] == gen) h = (h + 1U) & (VB_SEEN_HT - 1U);
+                seen_g[h] = gen;
+                seen_k[h] = sv[i];
+            }
+
+            int n_req = 0;
+            uint32_t base_can1_mask = 0U;
+            double base_d[32];
+            for (int k = 0; k < nr; k++) {
+                uint64_t t = rem_t[k];
+                uint8_t ti = rem_ti[k];
+                uint64_t mg = t;
+                int c1 = 0;
+                if (n_req < req_cap) reqs[n_req++] = (VBReq){t, ti};
+
+                #define PUSH_REQ(VAL) do { \
+                    uint64_t _nv = (VAL); \
+                    if (_nv > 0ULL && _nv <= vl && _nv != t) { \
+                        if (n_req < req_cap) reqs[n_req++] = (VBReq){_nv, ti}; \
+                        uint64_t _df = vb_nearest_diff_u64(sv, nv, _nv); \
+                        if (_df == 0ULL) c1 = 1; \
+                        else if (_df < mg) mg = _df; \
+                    } \
+                } while (0)
+
+                for (int i = 0; i < nv; i++) {
+                    uint64_t u = sv[i];
+                    if (t > u) PUSH_REQ(t - u);
+                    if (u <= vl - t) PUSH_REQ(t + u);
+                    if (u > t) PUSH_REQ(u - t);
+                    if (u > 1ULL && (t % u == 0ULL)) PUSH_REQ(t / u);
+                    if ((u128)t * (u128)u <= (u128)vl) PUSH_REQ(t * u);
+                }
+                uint64_t sq = vb_isqrt64(t);
+                if (sq > 1ULL && sq * sq == t) PUSH_REQ(sq);
+                if ((t & 1ULL) == 0ULL) PUSH_REQ(t >> 1);
+                #undef PUSH_REQ
+
+                if (c1) {
+                    base_can1_mask |= (1U << ti);
+                    base_d[ti] = 1.0;
+                } else {
+                    base_d[ti] = 2.0 + 0.25 * (double)bl64(mg);
+                }
+            }
+            qsort(reqs, (size_t)n_req, sizeof(VBReq), vb_cmp_req);
+
+            VBChild top_c[VB_K_CHILD];
+            int nt_c = 0, wt_c = 0;
+
+            #define TEST_CAND(XV, OPV, AV, BV) do { \
+                uint64_t _x = (XV); \
+                if (_x > 0ULL && _x <= vl) { \
+                    uint32_t _h = (uint32_t)hash64(_x) & (VB_SEEN_HT - 1U); \
+                    int _dup = 0; \
+                    for (uint32_t _pr = 0; _pr < 64U; _pr++) { \
+                        if (seen_g[_h] != gen) break; \
+                        if (seen_k[_h] == _x) { _dup = 1; break; } \
+                        _h = (_h + 1U) & (VB_SEEN_HT - 1U); \
+                    } \
+                    if (!_dup && seen_g[_h] != gen) { \
+                        seen_g[_h] = gen; \
+                        seen_k[_h] = _x; \
+                        uint32_t _dm = 0U; \
+                        for (int _k = 0; _k < nr; _k++) { \
+                            if (_x == rem_t[_k]) _dm |= (1U << rem_ti[_k]); \
+                        } \
+                        if ((st->rem_mask & ~_dm) == 0U) { \
+                            out_op[step] = (uint8_t)(OPV); \
+                            out_a[step] = (AV); \
+                            out_b[step] = (BV); \
+                            out_r[step] = _x; \
+                            int32_t _hid = st->hist_id; \
+                            for (int _kk = step - 1; _kk >= 0 && _hid >= 0; _kk--) { \
+                                out_op[_kk] = hist[_hid].op; \
+                                out_a[_kk] = hist[_hid].a; \
+                                out_b[_kk] = hist[_hid].b; \
+                                out_r[_kk] = hist[_hid].r; \
+                                _hid = hist[_hid].parent; \
+                            } \
+                            ret = step + 1; \
+                            goto cleanup; \
+                        } \
+                        int _pos = vb_lb_req(reqs, n_req, _x); \
+                        uint32_t _um = 0U; \
+                        uint64_t _bg = UINT64_MAX; \
+                        if (_pos < n_req) { \
+                            uint64_t _d = reqs[_pos].need - _x; \
+                            if (_d < _bg) _bg = _d; \
+                            int _p = _pos; \
+                            while (_p < n_req && reqs[_p].need == _x) { \
+                                _um |= (1U << reqs[_p].ti); \
+                                _p++; \
+                            } \
+                        } \
+                        if (_pos > 0) { \
+                            uint64_t _d = _x - reqs[_pos - 1].need; \
+                            if (_d < _bg) _bg = _d; \
+                        } \
+                        uint32_t _new_u = _um & ~base_can1_mask; \
+                        int32_t _qsc = (_dm ? 1000000 : 0) \
+                                     + 50000 * __builtin_popcount(_new_u) \
+                                     - 64 * bl64(_bg + 1ULL) \
+                                     - bl64(_x); \
+                        if (nt_c < VB_K_CHILD) { \
+                            top_c[nt_c] = (VBChild){_x, (AV), (BV), (uint8_t)(OPV), _qsc, _dm, _um}; \
+                            if (top_c[nt_c].quick_sc < top_c[wt_c].quick_sc) wt_c = nt_c; \
+                            nt_c++; \
+                        } else if (_qsc > top_c[wt_c].quick_sc) { \
+                            top_c[wt_c] = (VBChild){_x, (AV), (BV), (uint8_t)(OPV), _qsc, _dm, _um}; \
+                            wt_c = 0; \
+                            for (int _hi = 1; _hi < nt_c; _hi++) { \
+                                if (top_c[_hi].quick_sc < top_c[wt_c].quick_sc) wt_c = _hi; \
+                            } \
+                        } \
+                    } \
+                } \
+            } while (0)
+
+            for (int i = 0; i < nv; i++) {
+                uint64_t a = sv[i];
+                for (int j = i; j < nv; j++) {
+                    uint64_t b = sv[j];
+                    if (b <= vl - a) TEST_CAND(a + b, 1, a, b);
+                    if (a != b) TEST_CAND(b - a, 2, b, a);
+                    if (a > 1ULL && b > 1ULL && (u128)a * (u128)b <= (u128)vl) {
+                        TEST_CAND(a * b, 3, a, b);
+                    }
+                    if (i == j && a > 1ULL) {
+                        TEST_CAND(1ULL, 4, a, a);
+                    } else if (a > 1ULL && (b % a == 0ULL)) {
+                        TEST_CAND(b / a, 4, b, a);
+                    }
+                }
+            }
+            #undef TEST_CAND
+
+            for (int ci = 0; ci < nt_c; ci++) {
+                const VBChild *c = &top_c[ci];
+                uint32_t nrem = st->rem_mask & ~c->dmask;
+                double sc = 0.0;
+                for (int k = 0; k < nr; k++) {
+                    uint8_t ti = rem_ti[k];
+                    if ((nrem & (1U << ti)) == 0U) continue;
+                    uint64_t t = rem_t[k];
+                    if ((base_can1_mask & (1U << ti)) || (c->umask & (1U << ti))
+                        || (c->x + c->x == t) || ((u128)c->x * (u128)c->x == (u128)t)) {
+                        sc += 1.0;
+                    } else {
+                        uint64_t mg = vb_eval_gap_sv(t, c->x, sv, nv, vl);
+                        double dx = 2.0 + 0.25 * (double)bl64(mg);
+                        sc += (base_d[ti] < dx) ? base_d[ti] : dx;
+                    }
+                }
+                sc += 0.002 * (double)bl64(c->x);
+                if (n_cnext < max_cand_next) {
+                    cand_next[n_cnext++] = (VBCandNext){c->x, c->a, c->b, c->op, si, nrem, sc};
+                }
+            }
+        }
+
+        if (n_cnext == 0) break;
+        qsort(cand_next, (size_t)n_cnext, sizeof(VBCandNext), vb_cmp_next);
+
+        memset(g_ht, 0xFF, VB_SET_HT * sizeof(int32_t));
+        int n_nxt = 0;
+        for (int ci = 0; ci < n_cnext && n_nxt < beam_w; ci++) {
+            const VBCandNext *cn = &cand_next[ci];
+            const VBState *pst = &cur[cn->p_idx];
+            int nv = pst->nv;
+            uint64_t sorted_tmp[VB_MAX_POOL];
+            memcpy(sorted_tmp, pst->vals, (size_t)nv * sizeof(uint64_t));
+            sorted_tmp[nv] = cn->x;
+            qsort(sorted_tmp, (size_t)(nv + 1), sizeof(uint64_t), vb_cmp_u64);
+
+            uint64_t hv = vb_hash_arr(sorted_tmp, nv + 1);
+            uint32_t h = (uint32_t)hv & (VB_SET_HT - 1U);
+            int dup = 0;
+            while (g_ht[h] >= 0) {
+                int32_t idx = g_ht[h];
+                if (memcmp(&nxt_sorted[(size_t)idx * VB_MAX_POOL], sorted_tmp, (size_t)(nv + 1) * sizeof(uint64_t)) == 0) {
+                    dup = 1;
+                    break;
+                }
+                h = (h + 1U) & (VB_SET_HT - 1U);
+            }
+            if (dup) continue;
+            if (n_hist >= max_hist) break;
+
+            memcpy(&nxt_sorted[(size_t)n_nxt * VB_MAX_POOL], sorted_tmp, (size_t)(nv + 1) * sizeof(uint64_t));
+            g_ht[h] = (int32_t)n_nxt;
+
+            memcpy(nxt[n_nxt].vals, pst->vals, (size_t)nv * sizeof(uint64_t));
+            nxt[n_nxt].vals[nv] = cn->x;
+            nxt[n_nxt].nv = nv + 1;
+            nxt[n_nxt].rem_mask = cn->new_rem;
+
+            int32_t hid = n_hist++;
+            hist[hid] = (VBHist){pst->hist_id, cn->op, cn->a, cn->b, cn->x};
+            nxt[n_nxt].hist_id = hid;
+            n_nxt++;
+        }
+
+        if (n_nxt == 0) break;
+        VBState *tmp_ptr = cur; cur = nxt; nxt = tmp_ptr;
+        n_cur = n_nxt;
+    }
+
+cleanup:
+    free(cur); free(nxt); free(hist); free(cand_next); free(reqs);
+    free(seen_k); free(seen_g); free(g_ht); free(nxt_sorted);
+    return ret;
+}
 '''
 
 _CLIB_CACHE = None
@@ -1064,14 +1523,14 @@ def get_clib() -> Optional[ctypes.CDLL]:
     try:
         ext = ".dll" if os.name == "nt" else ".so"
         tdir = tempfile.gettempdir()
-        so_path = os.path.join(tdir, f"santa2026_fast_engine_v6{ext}")
+        so_path = os.path.join(tdir, f"santa2026_fast_engine_v8{ext}")
         if not os.path.exists(so_path):
             pid = os.getpid()
-            c_path = os.path.join(tdir, f"santa2026_fast_engine_v6_{pid}.c")
-            tmp_so = os.path.join(tdir, f"santa2026_fast_engine_v6_{pid}{ext}")
+            c_path = os.path.join(tdir, f"santa2026_fast_engine_v8_{pid}.c")
+            tmp_so = os.path.join(tdir, f"santa2026_fast_engine_v8_{pid}{ext}")
             with open(c_path, "w", encoding="utf-8") as f:
                 f.write(_C_SOURCE)
-            flags = ["gcc", "-O3", "-shared", "-fPIC"] + ([] if os.name == "nt" else ["-pthread"])
+            flags = ["gcc", "-O3", "-shared", "-fPIC"] + (["-static-libgcc"] if os.name == "nt" else ["-pthread"])
             subprocess.run(
                 flags + [c_path, "-o", tmp_so],
                 check=True,
@@ -1088,6 +1547,14 @@ def get_clib() -> Optional[ctypes.CDLL]:
                 os.remove(c_path)
             except OSError:
                 pass
+
+        if os.name == "nt" and hasattr(os, "add_dll_directory"):
+            gcc_exe = shutil.which("gcc")
+            if gcc_exe:
+                try:
+                    os.add_dll_directory(os.path.dirname(os.path.abspath(gcc_exe)))
+                except OSError:
+                    pass
 
         lib = ctypes.CDLL(so_path)
         lib.fe_univ_create.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_int]
@@ -1140,6 +1607,15 @@ def get_clib() -> Optional[ctypes.CDLL]:
             ctypes.POINTER(ctypes.c_uint32), ctypes.c_int,
             ctypes.POINTER(ctypes.c_int32),
         ]
+
+        lib.fe_value_beam64.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+        ]
+        lib.fe_value_beam64.restype = ctypes.c_int
 
         _CLIB_CACHE = lib
         return lib
@@ -1404,7 +1880,7 @@ class DictEngine:
         self._has_cache: dict[int, bool] = {}
         self._cost_cache: dict[int, int] = {}
         self._tp_cache: dict[int, list[tuple[int, int, int, int, int]]] = {}
-        self._mitm_cache: dict[int, list[tuple[int, int, int, int, int]]] = {}
+        self._mitm_cache: dict[tuple[int, bool], list[tuple[int, int, int, int, int]]] = {}
         self.ctx = None
         self.univ_ctx = None
         self.py_backend: Optional[_PyDictBackend] = None
@@ -1457,6 +1933,23 @@ class DictEngine:
         if self.ctx is not None and self.clib is not None:
             self.clib.fe_dict_free(self.ctx)
             self.ctx = None
+
+    def set_allow_univ(self, allow: bool) -> None:
+        """Toggle visibility of shared `{1}` Universal `U` with zero rebuild cost."""
+        new_u = _UNIV_CTX if (allow and self.ctx is not None) else None
+        if new_u == self.univ_ctx:
+            return
+        self.univ_ctx = new_u
+        self._node_cache.clear()
+        self._has_cache.clear()
+        self._cost_cache.clear()
+        self._tp_cache.clear()
+        self.powers.clear()
+        pw = 1
+        while pw <= self.vl:
+            if self.has(pw):
+                self.powers.add(pw)
+            pw *= 2
 
     def has(self, v: int) -> bool:
         if v <= 0 or v > self.vl:
@@ -1582,8 +2075,9 @@ class DictEngine:
         if self.py_backend is not None or self.ctx is None or tgt <= 100:
             return []
         max_div = int(self.profile["mitm_div_scan"])
+        u_key = (tgt, self.univ_ctx is not None)
 
-        static_hits = self._mitm_cache.get(tgt)
+        static_hits = self._mitm_cache.get(u_key)
         if static_hits is None:
             empty_act = (ctypes.c_uint64 * 1)(0)
             oa = (ctypes.c_uint64 * K)()
@@ -1596,7 +2090,7 @@ class DictEngine:
                 empty_act, 0, ctypes.c_uint32(max_div), K, oa, oq, or_, osgn, osc
             )
             static_hits = [(oa[i], oq[i], or_[i], osgn[i], osc[i]) for i in range(nh)]
-            self._mitm_cache[tgt] = static_hits
+            self._mitm_cache[u_key] = static_hits
 
         na = min(len(active_vals), 256)
         if na > 0:
@@ -1638,3 +2132,59 @@ class DictEngine:
         )
         ranked = sorted(zip(out_arr, k_cands), key=lambda x: x[0])
         return [k for sc, k in ranked[:top_m] if sc < 9999]
+
+
+def solve_value_beam(
+    puzzle: Puzzle, *, beam_w: int = 140, max_steps: int = 40
+) -> Optional[list[Instruction]]:
+    """
+    Run C99 64-bit 2-step lookahead Value-Set Beam Search on small/medium puzzles
+    (`vl <= 25M`, `<= 15` targets) and compile its acyclic DAG into `Instruction`s.
+    """
+    seeds = sorted(set(puzzle.seeds))
+    targets = sorted(set(puzzle.targets) - set(seeds))
+    if not targets:
+        return []
+    if (
+        puzzle.value_limit >= (1 << 63)
+        or not seeds
+        or len(seeds) >= 95
+        or len(targets) > 31
+        or any(t <= 0 or t > puzzle.value_limit for t in targets)
+    ):
+        return None
+
+    clib = get_clib()
+    if clib is None:
+        return None
+
+    s_arr = (ctypes.c_uint64 * len(seeds))(*seeds)
+    t_arr = (ctypes.c_uint64 * len(targets))(*targets)
+    out_op = (ctypes.c_uint8 * max_steps)()
+    out_a = (ctypes.c_uint64 * max_steps)()
+    out_b = (ctypes.c_uint64 * max_steps)()
+    out_r = (ctypes.c_uint64 * max_steps)()
+
+    k = int(
+        clib.fe_value_beam64(
+            s_arr, len(seeds),
+            t_arr, len(targets),
+            ctypes.c_uint64(puzzle.value_limit),
+            int(beam_w), int(max_steps),
+            out_op, out_a, out_b, out_r,
+        )
+    )
+    if k <= 0:
+        return None
+
+    defs: dict[int, tuple[str, int, int]] = {}
+    for i in range(k):
+        op_code = int(out_op[i])
+        if op_code not in _OP_MAP:
+            return None
+        defs[int(out_r[i])] = (_OP_MAP[op_code], int(out_a[i]), int(out_b[i]))
+
+    from src.dag_compiler import compile_dag
+    from src.postpass import remove_dead_ops
+
+    return remove_dead_ops(puzzle, compile_dag(puzzle, defs, n_trials=24))

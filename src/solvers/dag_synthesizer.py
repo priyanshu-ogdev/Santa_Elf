@@ -657,8 +657,15 @@ def _synthesize_best_marginal(
         consider_ops(nops)
     elif de.powers:
         S = max(p.bit_length() - 1 for p in de.powers)
-        bp = 1 << max(1, S - 1)
-        if bp in de.powers and bp > 1:
+        split_shifts: list[int] = [max(1, S - 1)]
+        if depth >= 1 and v.bit_length() >= 40:
+            for sh in (20, 24, 28, 32, 36):
+                if sh not in split_shifts:
+                    split_shifts.append(sh)
+        for sh in split_shifts:
+            bp = 1 << sh
+            if bp not in de.powers or bp <= 1 or bp >= v:
+                continue
             q, r = divmod(v, bp)
             if r > bp // 2 and (q + 1) * bp <= vl:
                 q += 1
@@ -667,9 +674,23 @@ def _synthesize_best_marginal(
             else:
                 sgn = "+"
             if 0 < q * bp <= vl:
-                qo = _naf_ops(q, vl, de.powers)
-                ro = _naf_ops(r, vl, de.powers) if r > 0 else []
-                if (q == 1 or qo) and (r == 0 or ro):
+                q_ok = (q == 1 or q in active_set or de.has(q))
+                qo = [] if q_ok else _naf_ops(q, vl, de.powers)
+                if not q_ok and not qo and depth >= 2 and q.bit_length() <= 32:
+                    tp_q = de.two_pointer(q, K=1)
+                    if tp_q:
+                        d1q, d2q, pq, gq, sgq = tp_q[0]
+                        if gq == 0:
+                            qo = [("*", d1q, d2q, pq)]
+                            q_ok = True
+                        elif gq in active_set or de.has(gq):
+                            qo = ([("*", d1q, d2q, pq)] if pq not in active_set else []) + [
+                                ("+" if sgq == 1 else "-", pq, gq, q)
+                            ]
+                            q_ok = True
+                r_ok = (r == 0 or r in active_set or de.has(r))
+                ro = [] if r_ok else _naf_ops(r, vl, de.powers)
+                if (q_ok or qo) and (r_ok or ro):
                     sub = list(qo)
                     if q > 1:
                         sub.append(("*", q, bp, q * bp))
@@ -726,7 +747,8 @@ def _synthesize_best_marginal(
         elif gap in active_set or de.has(gap):
             consider_ops(sub + [(sgn, prod, gap, v)])
         elif depth >= 2:
-            g_added = _synthesize_best_marginal(gap, active_defs, active_sorted, de, depth=0)
+            res_depth = 1 if tried_ap <= 2 else 0
+            g_added = _synthesize_best_marginal(gap, active_defs, active_sorted, de, depth=res_depth)
             if g_added is not None:
                 consider_ops(
                     list(sub)
@@ -1059,44 +1081,52 @@ def solve(
             latent_roots + sorted(targets, key=lambda t: (-t.bit_length(), t)),
         ]
 
+        has_univ = de.univ_ctx is not None
+        univ_modes = (True, False) if has_univ else (True,)
         best_defs: Optional[dict[int, tuple[str, int, int]]] = None
+        best_univ: bool = True
         cand_recipes: dict[int, list[dict[int, tuple[str, int, int]]]] = defaultdict(list)
 
-        for order in orderings:
-            active_defs: dict[int, tuple[str, int, int]] = {}
-            active_sorted = sorted(de.seeds)
-            active_set = set(active_sorted)
+        for allow_u in univ_modes:
+            de.set_allow_univ(allow_u)
+            for order in orderings:
+                active_defs: dict[int, tuple[str, int, int]] = {}
+                active_sorted = sorted(de.seeds)
+                active_set = set(active_sorted)
 
-            for item in order:
-                col: list[dict[int, tuple[str, int, int]]] = [] if item in targets else None  # type: ignore[assignment]
-                added = _synthesize_best_marginal(
-                    item,
-                    active_defs,
-                    active_sorted,
-                    de,
-                    depth=2,
-                    extra_cands=smooth_map.get(item),
-                    recipe_collector=col,
-                )
-                if added is None and item in targets:
-                    # Guaranteed single-target NAF/binary rescue so 1 hard target never drops the whole DAG
-                    n_bk = _naf_ops(item, de.vl, de.powers)
-                    if n_bk:
-                        added = _sub_dag_new_nodes(n_bk, active_defs, de)
-                if col:
-                    cand_recipes[item].extend(col[:5])
-                if added:
-                    active_defs.update(added)
-                    active_set.update(added.keys())
-                    active_sorted = sorted(active_set)
+                for item in order:
+                    col: list[dict[int, tuple[str, int, int]]] = [] if item in targets else None  # type: ignore[assignment]
+                    added = _synthesize_best_marginal(
+                        item,
+                        active_defs,
+                        active_sorted,
+                        de,
+                        depth=2,
+                        extra_cands=smooth_map.get(item),
+                        recipe_collector=col,
+                    )
+                    if added is None and item in targets:
+                        # Guaranteed single-target NAF/binary rescue so 1 hard target never drops the whole DAG
+                        n_bk = _naf_ops(item, de.vl, de.powers)
+                        if n_bk:
+                            added = _sub_dag_new_nodes(n_bk, active_defs, de)
+                    if col:
+                        cand_recipes[item].extend(col[:5])
+                    if added:
+                        active_defs.update(added)
+                        active_set.update(added.keys())
+                        active_sorted = sorted(active_set)
 
-            if all(t in active_defs or t in seeds_set for t in targets):
-                if best_defs is None or len(active_defs) < len(best_defs):
-                    best_defs = active_defs
+                if all(t in active_defs or t in seeds_set for t in targets):
+                    if best_defs is None or len(active_defs) < len(best_defs):
+                        best_defs = active_defs
+                        best_univ = allow_u
 
         if best_defs is None:
             from src.solvers import binary_shared
             return binary_shared.solve(puzzle)
+
+        de.set_allow_univ(best_univ)
 
         def prune_dag(dmap: dict[int, tuple[str, int, int]], req: list[int] = targets) -> dict[int, tuple[str, int, int]]:
             keep: dict[int, tuple[str, int, int]] = {}
