@@ -305,9 +305,8 @@ def _precompute_smooth_bpe(
         if s > off_lim:
             raw_k.extend([s, -s])
 
-    target_best: dict[int, tuple[int, int, Counter[int], list[tuple[str, int, int, int]]]] = {}
+    target_cands: dict[int, list[tuple[int, int, Counter[int], list[tuple[str, int, int, int]]]]] = defaultdict(list)
     for t in targets:
-        # Use C99 trial-division screener to quickly isolate top 18 smoothest shifts
         k_short = de.screen_smooth_offsets(t, raw_k, _SMALL_PRIMES, top_m=18)
         cands = []
         seen_k = set()
@@ -323,79 +322,87 @@ def _precompute_smooth_bpe(
             facs, rem = _factor_hybrid(cand)
             if rem > 1 and rem not in de.seeds_set and not de.has(rem) and rem > 10**8:
                 continue
-            sc = len(facs) + (0 if rem == 1 else (1 if de.has(rem) else 6)) + (0 if k == 0 else 1)
+            if rem == 1 or rem in de.seeds_set:
+                rem_c = 0
+            else:
+                dc = de.lookup_cost(rem)
+                rem_c = dc if dc < 99 else (rem.bit_length() // 3 + 3)
+            sc = len(facs) + rem_c + (0 if k == 0 else 1)
             cands.append((sc, k, cand, facs, rem))
         if not cands:
             continue
         cands.sort(key=lambda x: x[0])
-        _, k, cand, facs, rem = cands[0]
-        counts = Counter(facs)
-        parts: list[int] = []
-        ops: list[tuple[str, int, int, int]] = []
-        ok = True
-        for p, e in counts.items():
-            if not de.has(p) and p not in de.seeds_set:
-                np = _naf_ops(p, vl, de.powers)
-                if not np:
+        for _, k, cand, facs, rem in cands[:2]:
+            counts = Counter(facs)
+            parts: list[int] = []
+            ops: list[tuple[str, int, int, int]] = []
+            ok = True
+            for p, e in counts.items():
+                if not de.has(p) and p not in de.seeds_set:
+                    np = _naf_ops(p, vl, de.powers)
+                    if not np:
+                        ok = False
+                        break
+                    ops.extend(np)
+                pe = p ** e
+                if pe > vl:
                     ok = False
                     break
-                ops.extend(np)
-            pe = p ** e
-            if pe > vl:
-                ok = False
-                break
-            if not de.has(pe) and e > 1:
-                res_p: Optional[int] = None
-                base = p
-                kk = e
-                while kk > 0:
-                    if kk & 1:
-                        if res_p is None:
-                            res_p = base
-                        else:
-                            nv = res_p * base
-                            if nv > vl:
+                if not de.has(pe) and e > 1:
+                    res_p: Optional[int] = None
+                    base = p
+                    kk = e
+                    while kk > 0:
+                        if kk & 1:
+                            if res_p is None:
+                                res_p = base
+                            else:
+                                nv = res_p * base
+                                if nv > vl:
+                                    ok = False
+                                    break
+                                if not de.has(nv):
+                                    ops.append(("*", res_p, base, nv))
+                                res_p = nv
+                        kk >>= 1
+                        if kk > 0:
+                            nb = base * base
+                            if nb > vl:
                                 ok = False
                                 break
-                            if not de.has(nv):
-                                ops.append(("*", res_p, base, nv))
-                            res_p = nv
-                    kk >>= 1
-                    if kk > 0:
-                        nb = base * base
-                        if nb > vl:
-                            ok = False
-                            break
-                        if not de.has(nb):
-                            ops.append(("*", base, base, nb))
-                        base = nb
-                if not ok:
-                    break
-            parts.append(pe)
-        if not ok or not parts:
-            continue
-        if rem > 1:
-            if not de.has(rem) and rem not in de.seeds_set:
-                tp = de.two_pointer(rem, K=4)
-                added_rem = False
-                for d1, d2, prod, gap, sgn in tp:
-                    if gap == 0 or de.has(gap):
-                        if not de.has(prod):
-                            ops.append(("*", d1, d2, prod))
-                        if gap > 0:
-                            ops.append(("+" if sgn == 1 else "-", prod, gap, rem))
-                        added_rem = True
+                            if not de.has(nb):
+                                ops.append(("*", base, base, nb))
+                            base = nb
+                    if not ok:
                         break
-                if not added_rem:
-                    nr = _naf_ops(rem, vl, de.powers)
-                    if not nr:
-                        continue
-                    ops.extend(nr)
-            parts.append(rem)
-        target_best[t] = (k, cand, Counter(parts), ops)
+                parts.append(pe)
+            if not ok or not parts:
+                continue
+            if rem > 1:
+                if not de.has(rem) and rem not in de.seeds_set:
+                    tp = de.two_pointer(rem, K=4)
+                    added_rem = False
+                    for d1, d2, prod, gap, sgn in tp:
+                        if gap == 0 or de.has(gap):
+                            if not de.has(prod):
+                                ops.append(("*", d1, d2, prod))
+                            if gap > 0:
+                                ops.append(("+" if sgn == 1 else "-", prod, gap, rem))
+                            added_rem = True
+                            break
+                    if not added_rem:
+                        nr = _naf_ops(rem, vl, de.powers)
+                        if not nr:
+                            continue
+                        ops.extend(nr)
+                parts.append(rem)
+            target_cands[t].append((k, cand, Counter(parts), ops))
 
-    # Byte-Pair Encoding CSE over factor multisets
-    multisets = {t: info[2].copy() for t, info in target_best.items()}
+    # Byte-Pair Encoding CSE over factor multisets (primary candidate per target + emit all)
+    multisets: dict[tuple[int, int], Counter[int]] = {}
+    for t, clist in target_cands.items():
+        for ci, info in enumerate(clist):
+            multisets[(t, ci)] = info[2].copy()
     bpe_ops: dict[int, tuple[str, int, int, int]] = {}
     for _ in range(25):
         pair_freq: Counter[tuple[int, int]] = Counter()
@@ -433,37 +440,43 @@ def _precompute_smooth_bpe(
                 ms[merged] += c
 
     out: dict[int, list[list[tuple[str, int, int, int]]]] = defaultdict(list)
-    for t, (k, cand, _, base_ops) in target_best.items():
-        ms = multisets[t]
-        ops = list(base_ops)
-        flat: list[int] = []
-        seen_b: set[int] = set()
-        for val, cnt in sorted(ms.items()):
-            flat.extend([val] * cnt)
-            stk = [val]
-            while stk:
-                u = stk.pop()
-                if u in seen_b or u not in bpe_ops:
-                    continue
-                seen_b.add(u)
-                op_e = bpe_ops[u]
-                ops.append(op_e)
-                stk.append(op_e[1])
-                stk.append(op_e[2])
-        flat.sort()
-        acc = flat[0]
-        ok = True
-        for f in flat[1:]:
-            nv = acc * f
-            if nv > vl:
-                ok = False
-                break
-            ops.append(("*", acc, f, nv))
-            acc = nv
-        if ok and acc == cand:
-            if k != 0:
-                ops.append(("-" if k > 0 else "+", cand, abs(k), t))
-            out[t].append(ops)
+    for t, clist in target_cands.items():
+        for ci, (k, cand, _, base_ops) in enumerate(clist):
+            ms = multisets[(t, ci)]
+            ops = list(base_ops)
+            flat: list[int] = []
+            seen_b: set[int] = set()
+            for val, cnt in sorted(ms.items()):
+                flat.extend([val] * cnt)
+                stk = [val]
+                while stk:
+                    u = stk.pop()
+                    if u in seen_b or u not in bpe_ops:
+                        continue
+                    seen_b.add(u)
+                    op_e = bpe_ops[u]
+                    ops.append(op_e)
+                    stk.append(op_e[1])
+                    stk.append(op_e[2])
+            flat.sort()
+            acc = flat[0]
+            ok = True
+            for f in flat[1:]:
+                nv = acc * f
+                if nv > vl:
+                    ok = False
+                    break
+                ops.append(("*", acc, f, nv))
+                acc = nv
+            if ok and acc == cand:
+                if k != 0:
+                    ops.append(("-" if k > 0 else "+", cand, abs(k), t))
+                elif not ops and de.has(t):
+                    ddef = de.get_dict_def(t)
+                    if ddef is not None:
+                        ops.append((ddef[0], ddef[1], ddef[2], t))
+                if ops:
+                    out[t].append(ops)
     return out
 
 
@@ -505,6 +518,44 @@ def _discover_latent_roots(targets: list[int], vl: int) -> list[int]:
     return [h for h, _ in roots.most_common(10)]
 
 
+def _target_mst_order(targets: list[int], de: DictEngine) -> list[int]:
+    """
+    Minimum Spanning Arborescence over targets scored by exact pair-bridge costs:
+    |t_v - t_u| or t_v = q * t_u +- r, chained cleanly so related targets build adjacent.
+    """
+    if len(targets) <= 2:
+        return sorted(targets, key=lambda x: (x.bit_length(), x))
+    unvis = set(targets)
+    start = min(unvis, key=lambda x: (de.lookup_cost(x), x.bit_length(), x))
+    order = [start]
+    unvis.remove(start)
+    best_edge = {}
+    for v in unvis:
+        best_edge[v] = de.lookup_cost(v) if de.has(v) else (v.bit_length() // 3 + 3)
+
+    while unvis:
+        u = order[-1]
+        for v in unvis:
+            # 1. Additive delta |v - u|
+            diff = abs(v - u)
+            dc = (1 + de.lookup_cost(diff)) if diff > 0 else 0
+            if dc < best_edge[v]:
+                best_edge[v] = dc
+            # 2. Quotient q*u +- r (when u < v)
+            if 1 < u < v:
+                q = round(v / u)
+                if q >= 1 and q * u <= de.vl:
+                    r = abs(v - q * u)
+                    qc = (1 if q > 1 else 0) + (de.lookup_cost(q) if q > 1 else 0)
+                    rc = 0 if r == 0 else (1 + de.lookup_cost(r))
+                    if qc + rc < best_edge[v]:
+                        best_edge[v] = qc + rc
+        nxt = min(unvis, key=lambda v: (best_edge[v], v.bit_length(), v))
+        order.append(nxt)
+        unvis.remove(nxt)
+    return order
+
+
 # ---------------------------------------------------------------------------
 # Marginal Synthesis Over All Engines
 # ---------------------------------------------------------------------------
@@ -532,10 +583,10 @@ def _synthesize_best_marginal(
 
     def consider_ops(ops_list: Optional[list[tuple[str, int, int, int]]]) -> None:
         nonlocal best_added
-        if ops_list is None:
+        if not ops_list:
             return
         nd = _sub_dag_new_nodes(ops_list, active_defs, de)
-        if nd is None:
+        if nd is None or (v not in nd and v not in active_defs and v not in seeds):
             return
         if recipe_collector is not None and len(nd) <= 28:
             recipe_collector.append(nd)
@@ -594,8 +645,8 @@ def _synthesize_best_marginal(
         for ops in extra_cands:
             consider_ops(ops)
 
-    # 4. Multi-Radix Horner (B in {8, 10, 12, 16, 32, 64}) & Squaring NAF / Chunk ceiling
-    for B in (16, 32, 64, 10, 12, 8):
+    # 4. Multi-Radix Signed-Digit Horner (incl. powers-of-2 chunked bases 256, 1024, 65536) & NAF
+    for B in (16, 32, 64, 256, 1024, 65536, 10, 12, 100, 8):
         if B < v and de.has(B):
             hops = _radix_horner_ops(v, B, de)
             if hops:
@@ -635,8 +686,8 @@ def _synthesize_best_marginal(
     nD = len(D_s)
     anchor_proposals = []
     cand_anchors = [a for a in active_sorted if 1 < a < v and a not in de.powers]
-    if len(cand_anchors) > 45:
-        cand_anchors = cand_anchors[-45:]
+    if len(cand_anchors) > 25:
+        cand_anchors = cand_anchors[-25:]
     for a in cand_anchors:
         q_int = v // a
         for qq in (q_int, q_int + 1):
@@ -999,10 +1050,12 @@ def solve(
     with DictEngine(puzzle, force_python=force_python, ram_gb=ram_gb) as de:
         smooth_map = _precompute_smooth_bpe(targets, de)
         latent_roots = _discover_latent_roots(targets, de.vl)
+        mst_order = _target_mst_order(targets, de)
 
         orderings = [
             latent_roots + sorted(targets, key=lambda t: (t.bit_length(), t)),
             latent_roots + sorted(targets, key=lambda t: (0 if t in smooth_map else 1, t.bit_length(), t)),
+            latent_roots + mst_order,
             latent_roots + sorted(targets, key=lambda t: (-t.bit_length(), t)),
         ]
 
@@ -1025,6 +1078,11 @@ def solve(
                     extra_cands=smooth_map.get(item),
                     recipe_collector=col,
                 )
+                if added is None and item in targets:
+                    # Guaranteed single-target NAF/binary rescue so 1 hard target never drops the whole DAG
+                    n_bk = _naf_ops(item, de.vl, de.powers)
+                    if n_bk:
+                        added = _sub_dag_new_nodes(n_bk, active_defs, de)
                 if col:
                     cand_recipes[item].extend(col[:5])
                 if added:

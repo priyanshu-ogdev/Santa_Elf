@@ -50,3 +50,23 @@
 - **Verified Post-Edit Checks:**
   - `pytest tests/ -v`: **`38 passed in 319.68s`** (nearly 2x faster than `579.63s`).
   - Isolated `submissions/kaggle_submission_cell.py` (`212.8 KB`, 12 scored puzzles, `U=8M` test cap): **`2,298` instructions in `33.4s`** (`77.8s -> 33.4s`, **2.3x faster**), `U` built in **`0.9s`**, `Verification PASSED with 0 errors!`.
+
+## Run 5 (Kaggle Verified): `265,096` Total Instructions (-74.4% vs Baseline)
+- **Verified Kaggle Output:** `Final Score: 265,096 total instructions.` (`0` verification errors across all 1,000 scored puzzles; down `-771,380` instructions from `1,036,476` baseline).
+- **Host Telemetry:** `U=500,000,000` nodes (`16.59 GB CoW`) initialized in `437.8s`; steady Host RAM `~18.0 / 31.35 GB` (`~13.3 GB Avail`); Total Elapsed `5,317.1s` (88.6 min).
+- **Post-Run Forensic Audit Findings:**
+  1. **Critical Bug #1 (Silent Fallback to `binary_shared` on Prime `<50k` Targets):** When `< 2^20` primes (e.g., `3637`, `45821`) hit `U` directly inside `_precompute_smooth_bpe`, `de.has(p)` skipped NAF generation with `flat = [t]`, appending empty `ops = []` to `extra_cands[t]`. `consider_ops([])` returned `{}` (`len 0`), causing `best_defs` check `t in active_defs` to fail and throwing away the entire puzzle DAG to `binary_shared.solve()` (`scored_0259: 794` instead of `173`; `scored_0884: 814` instead of `164`; `scored_0429: 831`; `scored_0835: 820`, etc.).
+  2. **Critical Bug #2 (Fake Cost=1 for Depth-8/9 `U` Nodes):** `de.has(rem)` scored `500M` `depth=8/9` nodes as cost `1`, causing `smooth_bpe` to discard true smooth factorizations and inflating `scored_0001` (`341` -> `403`).
+  3. **Hardware Bottleneck (`437.8s` `U` Init + Under-Utilized `13.3 GB` RAM):** Multi-GB random DRAM misses in single-threaded compaction & `Phase B` saturated GCP DRAM bandwidth while leaving `13.3 GB` RAM unused.
+
+## Run 6 (Pre-Submission): V7 Root Bug Fixes + SOTA Multi-Radix/Target-MST + 26M Local Dict
+- **Score-Crushing Fixes & SOTA Upgrades Applied:**
+  - **Bug #1 Fixed (`dag_synthesizer.py`):** Eliminated empty `ops = []` emissions on `< 50k` prime targets hit directly in `U`, guarded `consider_ops` with `v in nd`, and added single-target `_naf_ops` rescue so 1 hard target never dumps an entire puzzle to `binary_shared` (verified 8 Kaggle outliers collapsed **`5,501 -> 1,490` (`-72.9%`)**).
+  - **Bug #2 Fixed (`fast_engine.py` + `dag_synthesizer.py`):** Added `DictEngine.lookup_cost()` scoring C99 `meta_cost` + `+3` `U` penalty accurately and retaining `cands[:2]` diverse smooth factorizations inside `_precompute_smooth_bpe`.
+  - **SOTA Extensions:** Added `_target_mst_order` (Prim minimum directed transformation tree over target deltas & quotient bridges), extended Horner bases `(256, 1024, 65536, 100)`, and trimmed active anchor scan (`cand_anchors[-25:]`).
+  - **High-RAM Re-Balancing & Startup Speedup (`kaggle_high_ram`):**
+    - Removed `437.8s` single-threaded `u_ht` compaction loop and single-threaded `Phase C` bottleneck; parallelized `Phase B + Phase C` lock-free across 4 threads (`U = 360M` nodes, `HT = 2^31` $\implies$ `14.35 GB` CoW).
+    - Upgraded per-worker `D_local` to **`26,000,000`** seed-specific nodes (`~690 MB/worker × 4 = ~2.76 GB`, cutting two-pointer gap on `scored_0001` from `16` bits down to `10` bits at `20M`), `local_scan = 1,000,000`, and `milp_max_edges = 5,500` (`~20–24 GB` peak RSS).
+- **Verified Post-Final Edit Checks:**
+  - `pytest tests/ -v`: **`38 passed in 290.23s`** (`0` failures).
+  - Standalone `submissions/kaggle_submission_cell.py` (`216.2 KB`) E2E (`12` scored puzzles, `--cores 2 --ram-gb 4.0 --verify`): `2,318` instructions in `40.4s`, `U=8M` built in `1.2s`, `Verification PASSED with 0 errors!`.

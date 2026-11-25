@@ -114,21 +114,21 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
         eff_gb = max(avail_gb, 25.0) if (on_kaggle and total_gb >= 24.0) else avail_gb
 
     if eff_gb >= 22.0:
-        # Kaggle ~20-26 GB aggregate budget:
-        #   U: 500M nodes x 16B (8.00 GB) + HT=2^31 x 4B (8.59 GB) = 16.59 GB Read-Only CoW
-        #   + 4 workers x (10M local ~300 MB + 800k scan + MITM + MILP/Python) ~ 5-8 GB
+        # Kaggle ~20-25 GB aggregate budget:
+        #   U: 360M nodes x 16B (5.76 GB) + HT=2^31 x 4B (8.59 GB) = 14.35 GB Read-Only CoW
+        #   + 4 workers x (26M local ~690 MB + 1M scan + MITM + 5.5k MILP/Python) ~ 5-8 GB
         return {
             "mode": "kaggle_high_ram",
             "eff_gb": eff_gb,
-            "univ_cap": 500_000_000,
+            "univ_cap": 360_000_000,
             "univ_ht_pow": 31,
-            "local_cap": 10_000_000,
-            "local_ht_pow": 25,
-            "local_scan": 800_000,
-            "per_bucket": 160_000,
-            "mitm_div_scan": 250_000,
+            "local_cap": 26_000_000,
+            "local_ht_pow": 26,
+            "local_scan": 1_000_000,
+            "per_bucket": 450_000,
+            "mitm_div_scan": 240_000,
             "smooth_offset_lim": 256,
-            "milp_max_edges": 3500,
+            "milp_max_edges": 5500,
             "milp_time": 2.0,
             "compiler_trials": 64,
         }
@@ -406,6 +406,36 @@ static void univ_worker_body(UnivWorkerArg *w) {
             since_add = 0ULL;
         }
     }
+    /* Parallel Phase C: strided Phase A x d6 across 4 threads to top up 25..36b bands quickly */
+    if (w->local_n < (w->max_idx * 90U) / 100U && pa_end > w->d6_end) {
+        uint32_t stride_a = (pa_end - w->d6_end) > 30000U ? ((pa_end - w->d6_end) / 30000U) : 1U;
+        uint32_t stride_b = (w->d6_end - d5) > 7000U ? ((w->d6_end - d5) / 7000U) : 1U;
+        uint64_t since_c = 0ULL;
+        for (uint32_t i = w->d6_end; i < pa_end && w->local_n < w->max_idx; i += stride_a) {
+            uint64_t a = d->vals[i];
+            if (a == 0ULL || bl64(a) > 36) continue;
+            uint32_t prev_c = w->local_n;
+            for (uint32_t j = d5; j < w->d6_end && w->local_n < w->max_idx; j += stride_b) {
+                uint64_t b = d->vals[j];
+                if (bl64(b) > 36) continue;
+                u128 p = (u128)a * (u128)b;
+                if (p <= (u128)d->vl) univ_par_add(w, (uint64_t)p, i, j, OP_MUL, 9);
+                u128 s = (u128)a + (u128)b;
+                if (s <= (u128)d->vl) univ_par_add(w, (uint64_t)s, i, j, OP_ADD, 9);
+                if (a != b) {
+                    uint64_t hi = a > b ? a : b, lo = a > b ? b : a;
+                    uint32_t phi = a > b ? i : j, plo = a > b ? j : i;
+                    univ_par_add(w, hi - lo, phi, plo, OP_SUB, 9);
+                }
+            }
+            if (w->local_n == prev_c) {
+                since_c += 7000ULL;
+                if (since_c > 12000000ULL) break;
+            } else {
+                since_c = 0ULL;
+            }
+        }
+    }
 }
 
 #ifdef _WIN32
@@ -518,69 +548,17 @@ EXPORT void* fe_univ_create(uint32_t cap, uint32_t ht_pow, int n_threads) {
         for (int t = 0; t < n_threads; t++) pthread_create(&th[t], NULL, posix_univ_worker, &wargs[t]);
         for (int t = 0; t < n_threads; t++) pthread_join(th[t], NULL);
 #endif
-        /* Compact Phase B segments contiguously from pa_end so Phase C & lookups have 0 gaps */
-        uint32_t write_pos = pa_end;
+        /* Skip multi-GB HT compaction: mark seen24 linearly in ~0.2s, leave shard arrays in place! */
         for (int t = 0; t < n_threads; t++) {
             uint32_t base = wargs[t].base_idx;
             uint32_t ln = wargs[t].local_n;
             for (uint32_t k = 0; k < ln; k++) {
-                uint32_t src_idx = base + k;
-                uint64_t vv = d->vals[src_idx];
+                uint64_t vv = d->vals[base + k];
                 if (vv < (1ULL << 24)) d->seen24[vv >> 6] |= (1ULL << (vv & 63));
-                if (write_pos != src_idx) {
-                    d->vals[write_pos] = vv;
-                    d->meta[write_pos] = d->meta[src_idx];
-                    d->vals[src_idx] = 0ULL;
-                    /* Update hash table pointer to new compacted index */
-                    uint64_t hv = hash64(vv);
-                    uint32_t sh = (uint32_t)(hv >> 58) & (N_SHARDS - 1);
-                    uint32_t sb = sh << d->shard_shift;
-                    uint32_t sm = d->shard_mask;
-                    uint32_t h = (uint32_t)hv & sm;
-                    while (d->ht[sb | h] >= 0) {
-                        if ((uint32_t)d->ht[sb | h] == src_idx) {
-                            d->ht[sb | h] = (int32_t)write_pos;
-                            break;
-                        }
-                        h = (h + 1U) & sm;
-                    }
-                }
-                write_pos++;
             }
             total_valid += ln;
         }
         d->n = total_valid;
-    }
-
-    /* Phase C: bounded strided fill if still <90% of cap, with stall break */
-    if (d->n < (cap * 90U) / 100U && pa_end > d6_end) {
-        uint32_t stride_a = (pa_end - d6_end) > 25000U ? ((pa_end - d6_end) / 25000U) : 1U;
-        uint32_t stride_b = (d6_end - d5_end) > 6000U ? ((d6_end - d5_end) / 6000U) : 1U;
-        uint64_t since_c = 0ULL;
-        for (uint32_t i = d6_end; i < pa_end && d->n < cap; i += stride_a) {
-            uint64_t a = d->vals[i];
-            if (a == 0ULL || bl64(a) > 36) continue;
-            uint32_t prev_c = d->n;
-            for (uint32_t j = d5_end; j < d6_end && d->n < cap; j += stride_b) {
-                uint64_t b = d->vals[j];
-                if (bl64(b) > 36) continue;
-                u128 p = (u128)a * (u128)b;
-                if (p <= (u128)d->vl) bd_add(d, (uint64_t)p, i, j, OP_MUL, 9, 1);
-                u128 s = (u128)a + (u128)b;
-                if (s <= (u128)d->vl) bd_add(d, (uint64_t)s, i, j, OP_ADD, 9, 1);
-                if (a != b) {
-                    uint64_t hi = a > b ? a : b, lo = a > b ? b : a;
-                    uint32_t phi = a > b ? i : j, plo = a > b ? j : i;
-                    bd_add(d, hi - lo, phi, plo, OP_SUB, 9, 1);
-                }
-            }
-            if (d->n == prev_c) {
-                since_c += 6000ULL;
-                if (since_c > 15000000ULL) break;
-            } else {
-                since_c = 0ULL;
-            }
-        }
     }
 
     /* Extract compact high-yield divisor array `scan_vals` (~300k items: 100k <=23b + 200k 24..34b) */
@@ -1424,6 +1402,7 @@ class DictEngine:
 
         self._node_cache: dict[int, Optional[tuple[str, int, int]]] = {}
         self._has_cache: dict[int, bool] = {}
+        self._cost_cache: dict[int, int] = {}
         self._tp_cache: dict[int, list[tuple[int, int, int, int, int]]] = {}
         self._mitm_cache: dict[int, list[tuple[int, int, int, int, int]]] = {}
         self.ctx = None
@@ -1499,6 +1478,42 @@ class DictEngine:
             return True
         self._has_cache[v] = False
         return False
+
+    def lookup_cost(self, v: int) -> int:
+        """Return estimated DAG op cost of `v` in `D_local` / `U` (or 99 if absent)."""
+        if v in self.seeds_set:
+            return 0
+        if v <= 0 or v > self.vl:
+            return 99
+        c_hit = self._cost_cache.get(v)
+        if c_hit is not None:
+            return c_hit
+        if self.py_backend is not None:
+            c = self.py_backend.cost.get(v, 99)
+            self._cost_cache[v] = c
+            return c
+        idx = self.clib.fe_dict_lookup(self.ctx, ctypes.c_uint64(v))
+        src_ctx = self.ctx
+        penalty = 0
+        if idx < 0 and self.univ_ctx is not None:
+            idx = self.clib.fe_dict_lookup(self.univ_ctx, ctypes.c_uint64(v))
+            src_ctx = self.univ_ctx
+            penalty = 3  # Penalize `{1}`-rooted `U` depth slightly vs `D_local` seed reuse
+        if idx < 0:
+            self._cost_cache[v] = 99
+            return 99
+        vp = ctypes.c_uint64()
+        ap = ctypes.c_uint64()
+        bp = ctypes.c_uint64()
+        op = ctypes.c_int()
+        cp = ctypes.c_int()
+        self.clib.fe_dict_get(
+            src_ctx, ctypes.c_uint32(idx), ctypes.byref(vp), ctypes.byref(ap),
+            ctypes.byref(bp), ctypes.byref(op), ctypes.byref(cp)
+        )
+        res_c = max(1, cp.value + penalty) if op.value >= 0 else 99
+        self._cost_cache[v] = res_c
+        return res_c
 
     def get_dict_def(self, v: int) -> Optional[tuple[str, int, int]]:
         if v in self._node_cache:
