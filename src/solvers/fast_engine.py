@@ -147,6 +147,7 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
             "milp_max_edges": 7000,
             "milp_time": 2.5,
             "compiler_trials": 120,
+            "superopt_time": 2.0,
         }
     if eff_gb >= 14.0:
         return {
@@ -163,6 +164,7 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
             "milp_max_edges": 4000,
             "milp_time": 1.8,
             "compiler_trials": 80,
+            "superopt_time": 1.6,
         }
     if eff_gb >= 6.5:
         return {
@@ -179,6 +181,7 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
             "milp_max_edges": 3000,
             "milp_time": 1.2,
             "compiler_trials": 64,
+            "superopt_time": 1.4,
         }
     return {
         "mode": "compact_ram",
@@ -194,6 +197,7 @@ def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str
         "milp_max_edges": 2000,
         "milp_time": 0.6,
         "compiler_trials": 64,
+        "superopt_time": 1.2,
     }
 
 

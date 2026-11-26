@@ -191,12 +191,18 @@ def _solve_puzzle_with_telemetry(
     # --- C99 2-step + Dictionary-Guided Value-Set Beam Search (small/medium <=100M, <=20t) ---
     if 40 <= puzzle.value_limit and puzzle.targets and max(puzzle.targets) <= 100_000_000 and len(puzzle.targets) <= 20:
         try:
-            from src.solvers.fast_engine import solve_value_beam
+            from src.solvers.fast_engine import solve_value_beam, _UNIV_CTX
             vb_lim = min(puzzle.value_limit, max(25_000_000, max(puzzle.targets) * 4))
-            vb_puzzle = puzzle if vb_lim == puzzle.value_limit else Puzzle(puzzle.id, puzzle.seeds, puzzle.targets, vb_lim)
-            vb_prog = solve_value_beam(vb_puzzle, beam_w=240, max_steps=72, use_univ=True)
-            if vb_prog is not None and verify_program(puzzle, vb_prog).valid:
-                candidates.append(("solve_value_beam", vb_prog))
+            vb_puzzle = (
+                puzzle
+                if vb_lim == puzzle.value_limit
+                else Puzzle(puzzle.id, puzzle.seeds, puzzle.targets, vb_lim, registers=puzzle.registers)
+            )
+            univ_opts = (True, False) if _UNIV_CTX is not None else (False,)
+            for u_opt in univ_opts:
+                vb_prog = solve_value_beam(vb_puzzle, beam_w=240, max_steps=72, use_univ=u_opt)
+                if vb_prog is not None and verify_program(puzzle, vb_prog).valid:
+                    candidates.append(("solve_value_beam", vb_prog))
         except Exception as e:
             warnings.append(f"solve_value_beam failed on {puzzle.id}: {e!r}")
 

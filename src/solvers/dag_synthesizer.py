@@ -565,13 +565,17 @@ def _discover_latent_roots(targets: list[int], vl: int) -> list[int]:
             g0 = math.gcd(A, B)
             if 100 < g0 < A:
                 roots[g0] += max(4, g0.bit_length())
-            for off_a in (-1, 0, 1):
-                for off_b in (-1, 0, 1):
+            for off_a in (-2, -1, 0, 1, 2):
+                for off_b in (-2, -1, 0, 1, 2):
                     if off_a == 0 and off_b == 0:
                         continue
                     ga = math.gcd(A + off_a, B + off_b)
                     if 100 < ga < A:
                         roots[ga] += max(2, ga.bit_length() // 2)
+            for k_eq in (-8, -7, -6, -5, -4, -3, 3, 4, 5, 6, 7, 8):
+                ga = math.gcd(A + k_eq, B + k_eq)
+                if 100 < ga < A:
+                    roots[ga] += max(2, ga.bit_length() // 2)
             if B > A:
                 # Quick continued-fraction convergent check for n*A ≈ d*B
                 x, y = B, A
@@ -746,6 +750,25 @@ def _synthesize_best_marginal(
     if best_added is not None and len(best_added) <= 1:
         return best_added
 
+    # 2b. Active Pair Sum/Diff 2-op Bridge (`v ≈ (a +- b) +- gap` for non-power active hubs)
+    if depth >= 2 and len(active_sorted) >= 2:
+        act_p = [a for a in active_sorted if a > 100 and a not in de.powers][-24:]
+        np_len = len(act_p)
+        for ia in range(np_len):
+            aa = act_p[ia]
+            for ib in range(ia + 1, np_len):
+                bb = act_p[ib]
+                for op_ab, comb in (("+", aa + bb), ("-", bb - aa)):
+                    if comb <= 0 or comb > vl or comb in active_set:
+                        continue
+                    gap = abs(v - comb)
+                    if gap == 0:
+                        consider_ops([(op_ab, aa if op_ab == "+" else bb, bb if op_ab == "+" else aa, v)])
+                    elif gap in active_set or de.has(gap):
+                        op_g = "+" if v >= comb else "-"
+                        pa, pb = (aa, bb) if op_ab == "+" else (bb, aa)
+                        consider_ops([(op_ab, pa, pb, comb), (op_g, comb, gap, v)])
+
     # 3. Precomputed smooth-BPE candidates
     if extra_cands:
         for ops in extra_cands:
@@ -810,6 +833,19 @@ def _synthesize_best_marginal(
                             q_ok = True
                 r_ok = (r == 0 or r in active_set or de.has(r))
                 ro = [] if r_ok else _naf_ops(r, vl, de.powers)
+                if not r_ok and not ro and depth >= 2 and 14 <= r.bit_length() <= 38:
+                    tp_r = de.two_pointer(r, K=2, fast=True)
+                    for d1r, d2r, pr, gr, sgr in tp_r:
+                        if gr == 0:
+                            ro = [("*", d1r, d2r, pr)]
+                            r_ok = True
+                            break
+                        if gr in active_set or de.has(gr):
+                            ro = ([("*", d1r, d2r, pr)] if (pr not in active_set and not de.has(pr)) else []) + [
+                                ("+" if sgr == 1 else "-", pr, gr, r)
+                            ]
+                            r_ok = True
+                            break
                 if (q_ok or qo) and (r_ok or ro):
                     sub = list(qo)
                     if q > 1:
@@ -841,6 +877,16 @@ def _synthesize_best_marginal(
                 sub = [("*", a, qq, prod)] if prod not in active_set else []
             else:
                 qops = _naf_ops(qq, vl, de.powers)
+                if not qops and depth >= 2 and 14 <= qq.bit_length() <= 36:
+                    for d1q, d2q, pq, gq, sgq in de.two_pointer(qq, K=2, fast=True):
+                        if gq == 0:
+                            qops = [("*", d1q, d2q, pq)]
+                            break
+                        if gq in active_set or de.has(gq):
+                            qops = ([("*", d1q, d2q, pq)] if (pq not in active_set and not de.has(pq)) else []) + [
+                                ("+" if sgq == 1 else "-", pq, gq, qq)
+                            ]
+                            break
                 if not qops:
                     continue
                 sub = qops + [("*", a, qq, prod)]
@@ -907,7 +953,7 @@ def _synthesize_best_marginal(
     # 6. Scaled ~20-bit multiplier split for >= 42-bit targets
     if depth >= 2 and v.bit_length() >= 42 and de.split_muls:
         q_cands = []
-        for m in de.split_muls[:4]:
+        for m in de.split_muls[:8]:
             q, r = divmod(v, m)
             if r > m // 2 and (q + 1) * m <= vl:
                 q += 1
@@ -1193,6 +1239,181 @@ def _milp_polish(
     return None
 
 
+def _superopt_windows(
+    puzzle: Puzzle,
+    program: list[Instruction],
+    de: DictEngine,
+    *,
+    time_budget: float = 1.8,
+) -> list[Instruction]:
+    """
+    Targeted C99 Sliding-Window Superoptimizer (`STOKE`-style) using the open
+    `DictEngine` (`D_local` + `U`). Prioritizes rematerialization/duplicate sites
+    and strictly verifies every replacement before accepting.
+    """
+    from src.solvers.fast_engine import solve_value_beam
+    from src.verifier import verify_program
+    from src.postpass import remove_dead_ops
+
+    t0 = time.monotonic()
+    cur = list(program)
+    n_regs = puzzle.registers
+    vl = puzzle.value_limit
+    all_targets = set(puzzle.targets)
+    has_u = de.univ_ctx is not None
+
+    for _pass in range(3):
+        if (time.monotonic() - t0) >= time_budget or len(cur) < 10:
+            break
+        n = len(cur)
+        states: list[list[Optional[int]]] = []
+        hits_before: list[set[int]] = []
+        regs: list[Optional[int]] = [None] * n_regs
+        for i, s in enumerate(puzzle.seeds):
+            regs[i] = s
+        hit_set = set(puzzle.seeds) & all_targets
+        states.append(list(regs))
+        hits_before.append(set(hit_set))
+        val_positions: dict[int, list[int]] = defaultdict(list)
+        for idx_i, ins in enumerate(cur):
+            va, vb = regs[ins.src1], regs[ins.src2]
+            rv = apply_op(ins.op, va, vb, vl) if (va is not None and vb is not None) else None
+            if rv is None:
+                return cur
+            regs[ins.dst] = rv
+            val_positions[rv].append(idx_i)
+            if rv in all_targets:
+                hit_set.add(rv)
+            states.append(list(regs))
+            hits_before.append(set(hit_set))
+
+        needed_after: list[set[int]] = [set() for _ in range(n + 1)]
+        need: set[int] = set()
+        for j in range(n - 1, -1, -1):
+            needed_after[j + 1] = set(need)
+            ins = cur[j]
+            need.discard(ins.dst)
+            need.add(ins.src1)
+            need.add(ins.src2)
+        needed_after[0] = set(need)
+
+        # Prioritize indices near rematerialized (duplicate-computed) instructions first
+        dup_starts: list[int] = []
+        seen_starts: set[int] = set()
+        for pos_list in val_positions.values():
+            if len(pos_list) >= 2:
+                for p_idx in pos_list[1:]:
+                    for off in (-6, -3, 0):
+                        st_i = p_idx + off
+                        if 0 <= st_i < n - 4 and st_i not in seen_starts:
+                            seen_starts.add(st_i)
+                            dup_starts.append(st_i)
+        scan_starts = dup_starts + [si for si in range(0, n - 4, 3) if si not in seen_starts]
+
+        did_any = False
+        for i in scan_starts:
+            if (time.monotonic() - t0) >= time_budget:
+                break
+            for w in (6, 9, 12):
+                j = i + w
+                if j > n:
+                    continue
+                in_regs = states[i]
+                out_regs = states[j]
+                need_regs_exit = needed_after[j]
+                mod_regs = {cur[k].dst for k in range(i, j)}
+                preserved_regs: set[int] = set()
+                req_exit_map: dict[int, int] = {}
+                out_vals_needed = set(hits_before[j] - hits_before[i])
+                for r_idx in need_regs_exit:
+                    v_out = out_regs[r_idx]
+                    if v_out is not None:
+                        if r_idx in mod_regs or in_regs[r_idx] != v_out:
+                            out_vals_needed.add(v_out)
+                            req_exit_map[r_idx] = v_out
+                        else:
+                            preserved_regs.add(r_idx)
+
+                in_vals = sorted({v for v in in_regs if v is not None and v > 0})
+                req_vals = sorted(out_vals_needed - set(in_vals))
+                if not req_vals or len(req_vals) > 3 or len(in_vals) >= 80:
+                    continue
+                if len([r for r in range(n_regs) if r not in preserved_regs]) < len(req_exit_map) + 2:
+                    continue
+
+                win_puz = Puzzle(puzzle.id, in_vals, req_vals, vl, registers=n_regs)
+                sub_prog = solve_value_beam(
+                    win_puz, beam_w=64, max_steps=w - 1, local_ctx=de.ctx, use_univ=has_u
+                )
+                if sub_prog is None or len(sub_prog) >= w:
+                    continue
+
+                w_regs: list[Optional[int]] = [None] * n_regs
+                for si, sv in enumerate(in_vals):
+                    w_regs[si] = sv
+                chron: list[tuple[str, int, int, int]] = []
+                valid_w = True
+                for ins_s in sub_prog:
+                    va, vb = w_regs[ins_s.src1], w_regs[ins_s.src2]
+                    vr = apply_op(ins_s.op, va, vb, vl) if (va is not None and vb is not None) else None
+                    if va is None or vb is None or vr is None:
+                        valid_w = False
+                        break
+                    w_regs[ins_s.dst] = vr
+                    chron.append((ins_s.op, va, vb, vr))
+                if not valid_w:
+                    continue
+
+                last_v_use: dict[int, int] = {}
+                for ci, (_, va, vb, _) in enumerate(chron):
+                    last_v_use[va] = ci
+                    last_v_use[vb] = ci
+                for rv in req_vals:
+                    last_v_use[rv] = len(chron) + 1
+                for rv in req_exit_map.values():
+                    last_v_use[rv] = len(chron) + 1
+
+                sim_phys = list(in_regs)
+                repl_insts: list[Instruction] = []
+                ok_map = True
+                for ci, (op, va, vb, vr) in enumerate(chron):
+                    ra = next((r for r, v in enumerate(sim_phys) if v == va), None)
+                    rb = next((r for r, v in enumerate(sim_phys) if v == vb), None)
+                    if ra is None or rb is None:
+                        ok_map = False
+                        break
+                    dst = None
+                    for tr, tv in req_exit_map.items():
+                        if tv == vr and sim_phys[tr] != tv and tr not in preserved_regs:
+                            dst = tr
+                            break
+                    if dst is None:
+                        for r in range(n_regs):
+                            if r in preserved_regs or r in req_exit_map:
+                                continue
+                            cv = sim_phys[r]
+                            if cv is None or (last_v_use.get(cv, -1) <= ci and cv not in req_exit_map.values()):
+                                dst = r
+                                break
+                    if dst is None:
+                        ok_map = False
+                        break
+                    repl_insts.append(Instruction(op, ra, rb, dst))
+                    sim_phys[dst] = vr
+
+                if ok_map and all(sim_phys[tr] == tv for tr, tv in req_exit_map.items()):
+                    cand_full = remove_dead_ops(puzzle, cur[:i] + repl_insts + cur[j:])
+                    if len(cand_full) < len(cur) and verify_program(puzzle, cand_full).valid:
+                        cur = cand_full
+                        did_any = True
+                        break
+            if did_any:
+                break
+        if not did_any:
+            break
+    return cur
+
+
 # ---------------------------------------------------------------------------
 # Public Entry Point
 # ---------------------------------------------------------------------------
@@ -1203,6 +1424,7 @@ def solve(
     force_python: bool = False,
     ram_gb: str | float = "auto",
     _diag_out: Optional[dict] = None,
+    _superopt_s: Optional[float] = None,
 ) -> list[Instruction]:
     """
     Solve `puzzle` using the 6-engine shared-DAG synthesizer, Rip-and-Reroute +
@@ -1489,6 +1711,15 @@ def solve(
                 milp_prog = remove_dead_ops(puzzle, compile_dag(puzzle, milp_defs, n_trials=n_trials))
                 if len(milp_prog) < len(best_prog) and verify_program(puzzle, milp_prog).valid:
                     best_prog = milp_prog
+            except Exception:
+                pass
+
+        so_budget = float(de.profile.get("superopt_time", 1.5)) if _superopt_s is None else _superopt_s
+        if so_budget > 0.0 and len(best_prog) >= 80:
+            try:
+                so_prog = _superopt_windows(puzzle, best_prog, de, time_budget=so_budget)
+                if len(so_prog) < len(best_prog) and verify_program(puzzle, so_prog).valid:
+                    best_prog = so_prog
             except Exception:
                 pass
 
