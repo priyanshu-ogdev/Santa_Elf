@@ -8,8 +8,8 @@ Key Engineering & Speed Upgrades:
      Uses 64 hash shards (`(hash64(v) >> 58) & 63`) so all 4 CPU threads populate
      independent shards + disjoint value slices with zero locks/atomics (~6 M nodes/s).
      On Kaggle (~30-31 GB RAM), builds `240,000,000` packed 16-byte nodes + `2^30`
-     4-byte hash slots (`~8.14 GB` Read-Only Copy-on-Write across all 4 workers),
-     freeing per-worker RAM & cache bandwidth for `D_local = 36,000,000`.
+     4-byte hash slots (`~8.15 GB` Read-Only Copy-on-Write across all 4 workers),
+     freeing per-worker RAM & cache bandwidth for `D_local = 24,000,000`.
   2. Zero-Stall `two_pointer` L3 Bitset:
      Retains the `2 MiB` `seen24` (`< 2^24`) bitset so `fe_two_pointer` evaluates
      gap reachability in ~1ns in L3 cache instead of missing DRAM in a multi-GB HT.
@@ -99,8 +99,8 @@ def get_ram_telemetry() -> dict[str, float]:
 def get_ram_profile(ram_gb: str | float = "auto") -> dict[str, int | float | str]:
     """
     Compute C99 Universal `U`, Per-Worker `D_local`, MILP, and Compiler budgets.
-    On Kaggle (~29-30 GB RAM, Linux CoW), defaults to `kaggle_high_ram` (~21-24 GB
-    aggregate: ~16.6 GB shared CoW `U` + 4 workers x ~1.2-1.8 GB).
+    On Kaggle (~29-31 GB RAM, Linux CoW), defaults to `kaggle_high_ram` (~12-14 GB
+    aggregate: ~8.15 GB shared CoW `U` + 4 workers x ~0.8-1.2 GB).
     """
     total_gb, avail_gb = detect_host_ram_gb()
     on_kaggle = os.path.exists("/kaggle")

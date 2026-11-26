@@ -217,7 +217,7 @@ def _solve_puzzle_with_telemetry(
             warnings.append(f"binary_shared failed on {puzzle.id}: {e!r}")
 
     # --- Specialised small-range solvers (fast path for < 10^7 targets) ---
-    if max(puzzle.targets) < 10**7 and label != PuzzleClass.TINY:
+    if puzzle.targets and max(puzzle.targets) < 10**7 and label != PuzzleClass.TINY:
         try:
             s_name = "meet_in_middle"
             prog = None

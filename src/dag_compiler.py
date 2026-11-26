@@ -823,30 +823,31 @@ def compile_dag(
         sched = _schedule_dfs(order, seeds, defs, m, lighter_first_on_tie=flip_tie)
         return try_schedule(sched, order, m)
 
-    try_schedule(_schedule_min_live(needed, defs, height))
+    for order in target_orders:
+        for m_eval in (ershov, height):
+            try_order(order, flip_tie=False, metric=m_eval)
+            if best_prog is not None and len(best_prog) == optimal_len:
+                break
+            try_order(order, flip_tie=True, metric=m_eval)
+            if best_prog is not None and len(best_prog) == optimal_len:
+                break
+        if best_prog is not None and len(best_prog) == optimal_len:
+            break
+
+    if best_prog is None or len(best_prog) > optimal_len:
+        try_schedule(_schedule_min_live(needed, defs, height))
     if best_prog is None or len(best_prog) > optimal_len:
         for pf in (False, True):
             for b_sched in _schedule_min_live_beam(
-                needed, defs, height, ershov, seeds, puzzle.registers, beam_w=12, pressure_first=pf
-            )[:6]:
+                needed, defs, height, ershov, seeds, puzzle.registers, beam_w=10, pressure_first=pf
+            )[:3]:
                 try_schedule(b_sched)
                 if best_prog is not None and len(best_prog) == optimal_len:
                     break
             if best_prog is not None and len(best_prog) == optimal_len:
                 break
-    if best_prog is None or len(best_prog) > optimal_len:
-        for order in target_orders:
-            for m_eval in (ershov, height):
-                try_order(order, flip_tie=False, metric=m_eval)
-                if best_prog is not None and len(best_prog) == optimal_len:
-                    break
-                try_order(order, flip_tie=True, metric=m_eval)
-                if best_prog is not None and len(best_prog) == optimal_len:
-                    break
-            if best_prog is not None and len(best_prog) == optimal_len:
-                break
 
-    # Fast liveness Simulated Annealing pre-search + bounded exact-allocator hill-climbing
+    # Fast flat-array liveness Simulated Annealing pre-search + exact-allocator hill-climbing
     if best_prog is not None and len(best_prog) > optimal_len and len(targets) > 2 and n_trials > 0:
         nodes_l = sorted(needed)
         n_l = len(nodes_l)
@@ -862,10 +863,52 @@ def compile_dag(
         n_regs = puzzle.registers
         n_seeds_base = len(seeds)
 
-        def _fast_pressure(ord_t: list[int], metric_ev: dict[int, int]) -> tuple[int, int, int]:
-            sc = _schedule_dfs(ord_t, seeds, defs, metric_ev, lighter_first_on_tie=True)
+        dfs_pair_cache: dict[int, tuple[list[int], list[int]]] = {}
+
+        def _get_dfs_pair(m_ev: dict[int, int]) -> tuple[list[int], list[int]]:
+            mid_k = id(m_ev)
+            cached = dfs_pair_cache.get(mid_k)
+            if cached is not None:
+                return cached
+            c0 = [-1] * n_l
+            c1 = [-1] * n_l
+            for u_i, v in enumerate(nodes_l):
+                _, a, b = defs[v]
+                ia = pa_l[u_i]
+                ib = pb_l[u_i]
+                if m_ev.get(a, 0) > m_ev.get(b, 0):
+                    c0[u_i] = ia
+                    c1[u_i] = ib if ib != ia else -1
+                else:
+                    c0[u_i] = ib
+                    c1[u_i] = ia if ia != ib else -1
+            dfs_pair_cache[mid_k] = (c0, c1)
+            return c0, c1
+
+        def _fast_pressure(ord_i: list[int], c0: list[int], c1: list[int]) -> tuple[int, int, int]:
+            vis = bytearray(n_l)
+            sc_i: list[int] = []
+            app = sc_i.append
+            for root in ord_i:
+                if vis[root]:
+                    continue
+                stk = [(root, 0)]
+                while stk:
+                    u, ph = stk.pop()
+                    if vis[u]:
+                        continue
+                    if ph == 0:
+                        stk.append((u, 1))
+                        u1 = c1[u]
+                        if u1 >= 0 and not vis[u1]:
+                            stk.append((u1, 0))
+                        u0 = c0[u]
+                        if u0 >= 0 and not vis[u0]:
+                            stk.append((u0, 0))
+                    else:
+                        vis[u] = 1
+                        app(u)
             lu = [-1] * n_l
-            sc_i = [idx_l[v] for v in sc]
             for st_i, u_i in enumerate(sc_i):
                 a_i = pa_l[u_i]
                 b_i = pb_l[u_i]
@@ -895,7 +938,7 @@ def compile_dag(
         rng = random.Random(42)
         t_sa = time.monotonic()
         init_spills = len(best_prog) - optimal_len
-        sa_budget = 1.35 if init_spills >= 14 else (0.85 if init_spills >= 5 else 0.35)
+        sa_budget = 0.85 if init_spills >= 14 else (0.55 if init_spills >= 5 else 0.25)
         start_configs: list[tuple[list[int], dict[int, int], float]] = [
             (list(best_order), best_metric, sa_budget * (0.65 if init_spills >= 8 and len(target_orders) > 1 else 1.0))
         ]
@@ -906,43 +949,45 @@ def compile_dag(
         seen_o: set[tuple[int, ...]] = set()
         for start_ord, eval_m, cfg_bud in start_configs:
             t_cfg = time.monotonic()
-            cur_order = list(start_ord)
-            cur_p = _fast_pressure(cur_order, eval_m)
+            c0_m, c1_m = _get_dfs_pair(eval_m)
+            cur_i = [idx_l[t] for t in start_ord]
+            cur_p = _fast_pressure(cur_i, c0_m, c1_m)
             best_p = cur_p
-            max_sa_steps = min(800, max(160, n_trials * 6))
+            max_sa_steps = min(1400, max(300, n_trials * 12))
             for st_sa in range(max_sa_steps):
                 if (time.monotonic() - t_cfg) > cfg_bud or (time.monotonic() - t_sa) > sa_budget:
                     break
-                cand_order = list(cur_order)
+                cand_i = list(cur_i)
                 mv = st_sa & 3
                 if mv == 0:
-                    i = rng.randrange(len(cand_order) - 1)
-                    cand_order[i], cand_order[i + 1] = cand_order[i + 1], cand_order[i]
+                    i = rng.randrange(len(cand_i) - 1)
+                    cand_i[i], cand_i[i + 1] = cand_i[i + 1], cand_i[i]
                 elif mv == 1:
-                    i, j = rng.sample(range(len(cand_order)), 2)
-                    cand_order[i], cand_order[j] = cand_order[j], cand_order[i]
+                    i, j = rng.sample(range(len(cand_i)), 2)
+                    cand_i[i], cand_i[j] = cand_i[j], cand_i[i]
                 elif mv == 2:
-                    i = rng.randrange(len(cand_order))
-                    j = rng.randrange(len(cand_order))
-                    val = cand_order.pop(i)
-                    cand_order.insert(j, val)
+                    i = rng.randrange(len(cand_i))
+                    j = rng.randrange(len(cand_i))
+                    val = cand_i.pop(i)
+                    cand_i.insert(j, val)
                 else:
-                    sz = min(3, max(2, len(cand_order) // 6))
-                    if len(cand_order) > sz + 1:
-                        i = rng.randrange(len(cand_order) - sz + 1)
-                        blk = cand_order[i : i + sz]
-                        del cand_order[i : i + sz]
-                        j = rng.randrange(len(cand_order) + 1)
-                        cand_order[j:j] = blk
-                p_sc = _fast_pressure(cand_order, eval_m)
-                if p_sc <= cur_p or (p_sc[0] - cur_p[0] <= 20 and rng.random() < 0.08):
-                    cur_order, cur_p = cand_order, p_sc
+                    sz = min(3, max(2, len(cand_i) // 6))
+                    if len(cand_i) > sz + 1:
+                        i = rng.randrange(len(cand_i) - sz + 1)
+                        blk = cand_i[i : i + sz]
+                        del cand_i[i : i + sz]
+                        j = rng.randrange(len(cand_i) + 1)
+                        cand_i[j:j] = blk
+                p_sc = _fast_pressure(cand_i, c0_m, c1_m)
+                allow_w = max(4, cur_p[0] // 25)
+                if p_sc <= cur_p or (p_sc[0] - cur_p[0] <= allow_w and rng.random() < 0.08):
+                    cur_i, cur_p = cand_i, p_sc
                     if p_sc <= best_p:
                         best_p = p_sc
-                        t_k = tuple(cand_order)
+                        t_k = tuple(cand_i)
                         if t_k not in seen_o:
                             seen_o.add(t_k)
-                            sa_pool.append((list(cand_order), eval_m))
+                            sa_pool.append(([nodes_l[ui] for ui in cand_i], eval_m))
 
         for sa_o, eval_m in sa_pool[-10:]:
             try_order(sa_o, flip_tie=False, metric=eval_m)

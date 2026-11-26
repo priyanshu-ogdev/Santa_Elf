@@ -213,3 +213,35 @@ class TestOrchestrator:
         from src.orchestrator import solve_puzzle
         tiny = [p for p in load_puzzles("data/puzzles.csv") if p.value_limit < 100][0]
         assert_valid(tiny, solve_puzzle(tiny, sa_time=0.0, n_starts=1), f"orchestrator tiny {tiny.id}")
+
+    def test_solve_empty_targets_edge(self):
+        from src.orchestrator import solve_puzzle
+        p = make_puzzle([3, 7], [], value_limit=1000, pid="empty_targets")
+        prog = solve_puzzle(p, sa_time=0.0, n_starts=1)
+        assert_valid(p, prog, "orchestrator empty_targets")
+        assert len(prog) == 0
+
+    def test_c99_act_probe_and_spilling_compiler(self):
+        import src.solvers.fast_engine as fe
+        from src.dag_compiler import compile_dag
+        p = make_puzzle([2, 3, 5, 7, 11], [100], value_limit=(1 << 50), pid="act_probe_test")
+        with fe.DictEngine(p, max_nodes=200_000, ram_gb="4.0") as de:
+            if de.clib is not None:
+                act = [2, 3, 5, 7, 11, 1009, 2027, 4099]
+                h1 = de.act_probe(1009 * 2027 + 5, act, K=8)
+                assert any(h[5] == 1009 * 2027 and h[6] == 5 for h in h1)
+                h2 = de.act_probe((1009 + 4099) * 100 + 3, act, K=8)
+                assert any(h[5] == (1009 + 4099) * 100 and h[6] == 3 for h in h2)
+        # Verify compiler handles multi-target overlapping DAGs safely
+        seq_defs = {1: ("/", 2, 2)}
+        t_list = []
+        prev = 11
+        for step in range(2, 65):
+            cur_v = prev + step
+            if step not in seq_defs and step not in {2, 3, 5, 7, 11}:
+                seq_defs[step] = ("+", 1, step - 1)
+            seq_defs[cur_v] = ("+", prev, step)
+            t_list.append(cur_v)
+            prev = cur_v
+        p_seq = make_puzzle([2, 3, 5, 7, 11], t_list, value_limit=10**9, pid="seq_compile")
+        assert_valid(p_seq, compile_dag(p_seq, seq_defs, n_trials=16), "compile_dag multi-target")
