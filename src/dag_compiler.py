@@ -450,6 +450,88 @@ def _schedule_min_live(
     return sched
 
 
+def _emergency_compile(
+    puzzle: Puzzle,
+    defs: dict[int, tuple[str, int, int]],
+    height: dict[int, int],
+) -> list[Instruction]:
+    """
+    Crash-proof low-pressure Sethi-Ullman subtree compiler fallback.
+    Builds targets one-by-one holding only `seeds` + an active evaluation stack
+    so any valid acyclic DAG with <= (registers - 4) seeds always compiles cleanly.
+    """
+    seeds = set(puzzle.seeds)
+    n_regs = puzzle.registers
+    targets = sorted(set(puzzle.targets) - seeds, key=lambda x: (height.get(x, 0), x))
+
+    val_to_reg: dict[int, int] = {}
+    reg_to_val: dict[int, int] = {}
+    seed_regs: set[int] = set()
+    for i, s in enumerate(puzzle.seeds):
+        if s not in val_to_reg:
+            val_to_reg[s] = i
+            reg_to_val[i] = s
+            seed_regs.add(i)
+
+    def _free_reg(protected_regs: set[int]) -> int:
+        for r in range(n_regs - 1, -1, -1):
+            if r not in reg_to_val and r not in protected_regs and r not in seed_regs:
+                return r
+        for r in range(n_regs - 1, -1, -1):
+            if r not in protected_regs and r not in seed_regs:
+                old_v = reg_to_val.pop(r)
+                val_to_reg.pop(old_v, None)
+                return r
+        raise RuntimeError(f"Too many pinned seed registers ({len(seed_regs)}) for {n_regs} regs")
+
+    instructions: list[Instruction] = []
+    tree_sz: dict[int, int] = {}
+
+    def tsize(u: int, vis: set[int]) -> int:
+        if u in seeds or u in val_to_reg:
+            return 0
+        if u in tree_sz:
+            return tree_sz[u]
+        if u in vis:
+            return 1
+        vis.add(u)
+        _, a, b = defs[u]
+        sz = 1 + tsize(a, vis) + (tsize(b, vis) if b != a else 0)
+        tree_sz[u] = sz
+        return sz
+
+    def eval_node(u: int, protected_regs: set[int]) -> int:
+        if u in val_to_reg:
+            return val_to_reg[u]
+        op, a, b = defs[u]
+        if a == b:
+            ra = eval_node(a, protected_regs)
+            dst = _free_reg(protected_regs | {ra})
+            val_to_reg[u] = dst
+            reg_to_val[dst] = u
+            instructions.append(Instruction(op=op, src1=ra, src2=ra, dst=dst))
+            return dst
+        sa = tsize(a, set())
+        sb = tsize(b, set())
+        if sa >= sb:
+            ra = eval_node(a, protected_regs)
+            rb = eval_node(b, protected_regs | {ra})
+            ra = val_to_reg[a] if a in val_to_reg else eval_node(a, protected_regs | {rb})
+        else:
+            rb = eval_node(b, protected_regs)
+            ra = eval_node(a, protected_regs | {rb})
+            rb = val_to_reg[b] if b in val_to_reg else eval_node(b, protected_regs | {ra})
+        dst = _free_reg(protected_regs | {ra, rb})
+        val_to_reg[u] = dst
+        reg_to_val[dst] = u
+        instructions.append(Instruction(op=op, src1=ra, src2=rb, dst=dst))
+        return dst
+
+    for t in targets:
+        eval_node(t, set())
+    return instructions
+
+
 def compile_dag(
     puzzle: Puzzle, defs: dict[int, tuple[str, int, int]], *, n_trials: int = 48
 ) -> list[Instruction]:
@@ -540,5 +622,5 @@ def compile_dag(
                     break
 
     if best_prog is None:
-        raise RuntimeError(f"Failed to compile DAG for puzzle {puzzle.id} in {puzzle.registers} regs")
+        return _emergency_compile(puzzle, defs, height)
     return best_prog

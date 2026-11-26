@@ -1328,7 +1328,7 @@ EXPORT void fe_screen_smooth(
     }
 }
 
-#define VB_MAX_POOL 96
+#define VB_MAX_POOL 120
 #define VB_K_CHILD  32
 #define VB_SEEN_HT  65536U
 #define VB_SET_HT   65536U
@@ -1495,8 +1495,42 @@ static inline uint64_t vb_hash_arr(const uint64_t *arr, int n) {
     return h ? h : 1ULL;
 }
 
+static inline double vb_dict_cost(const BigDict *d, const BigDict *u, uint64_t x) {
+    if (x == 0ULL || x >= (1ULL << 24)) return 1e9;
+    if (d && d->seen24 && (d->seen24[x >> 6] & (1ULL << (x & 63)))) {
+        int32_t id = bd_find(d, x);
+        if (id >= 0) return 1.5 + 1.0 * (double)meta_cost(d->meta[id]);
+    }
+    if (u && u->seen24 && (u->seen24[x >> 6] & (1ULL << (x & 63)))) {
+        int32_t iu = bd_find(u, x);
+        if (iu >= 0) return 2.5 + 1.0 * (double)meta_cost(u->meta[iu]);
+    }
+    return 1e9;
+}
+
+static inline double vb_dict_pair_ctg(const BigDict *d, const BigDict *u, uint64_t t, uint64_t x, uint64_t vl) {
+    if (!d && !u) return 1e9;
+    double best = 1e9, c;
+    if (t > x) { c = vb_dict_cost(d, u, t - x); if (c < best) best = c; }
+    else if (x > t) { c = vb_dict_cost(d, u, x - t); if (c < best) best = c; }
+    if (x <= vl - t) { c = vb_dict_cost(d, u, t + x); if (c < best) best = c; }
+    if (x > 1ULL && (t % x == 0ULL)) { c = vb_dict_cost(d, u, t / x); if (c < best) best = c; }
+    if ((u128)t * (u128)x <= (u128)vl) { c = vb_dict_cost(d, u, t * x); if (c < best) best = c; }
+    if (x > 16ULL && t > x) {
+        uint64_t q = t / x, r = t % x;
+        if (q < (1ULL << 24) && r < (1ULL << 24)) {
+            double cq = vb_dict_cost(d, u, q);
+            if (cq < 1e8) {
+                double cr = (r == 0ULL) ? 0.0 : vb_dict_cost(d, u, r);
+                if (cr < 1e8 && (1.0 + cq + cr < best)) best = 1.0 + cq + cr;
+            }
+        }
+    }
+    return best;
+}
+
 /*
- * C99 64-bit 2-step lookahead Value-Set Beam Search:
+ * C99 64-bit 2-step + Dictionary-Guided Value-Set Beam Search:
  * Discovers non-trivial shared intermediate registers across multiple targets.
  * Returns number of emitted instructions (>0 on success, 0 if unsolved).
  */
@@ -1504,8 +1538,11 @@ EXPORT int fe_value_beam64(
     const uint64_t *seeds, int n_seeds,
     const uint64_t *targets, int n_targets,
     uint64_t vl, int beam_w, int max_steps,
+    void *p_local, void *p_univ,
     uint8_t *out_op, uint64_t *out_a, uint64_t *out_b, uint64_t *out_r
 ) {
+    const BigDict *d = (const BigDict *)p_local;
+    const BigDict *u = (const BigDict *)p_univ;
     if (n_seeds <= 0 || n_targets <= 0 || n_targets > 31) return 0;
     if (n_seeds >= VB_MAX_POOL - 1 || beam_w <= 0 || max_steps <= 0) return 0;
     if (n_seeds + max_steps > VB_MAX_POOL) max_steps = VB_MAX_POOL - n_seeds;
@@ -1613,7 +1650,16 @@ EXPORT int fe_value_beam64(
                     base_can1_mask |= (1U << ti);
                     base_d[ti] = 1.0;
                 } else {
-                    base_d[ti] = 2.0 + 0.25 * (double)bl64(mg);
+                    double b_gap = 2.0 + 0.25 * (double)bl64(mg);
+                    if (d || u) {
+                        double dt = vb_dict_cost(d, u, t);
+                        if (dt < b_gap) b_gap = dt;
+                        for (int i = 0; i < nv; i++) {
+                            double dc = vb_dict_pair_ctg(d, u, t, sv[i], vl);
+                            if (dc < b_gap) b_gap = dc;
+                        }
+                    }
+                    base_d[ti] = b_gap;
                 }
             }
             qsort(reqs, (size_t)n_req, sizeof(VBReq), vb_cmp_req);
@@ -1722,6 +1768,10 @@ EXPORT int fe_value_beam64(
                     } else {
                         uint64_t mg = vb_eval_gap_sv(t, c->x, sv, nv, vl);
                         double dx = 2.0 + 0.25 * (double)bl64(mg);
+                        if (d || u) {
+                            double dc = vb_dict_pair_ctg(d, u, t, c->x, vl);
+                            if (dc < dx) dx = dc;
+                        }
                         sc += (base_d[ti] < dx) ? base_d[ti] : dx;
                     }
                 }
@@ -1930,6 +1980,7 @@ def get_clib() -> Optional[ctypes.CDLL]:
             ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
             ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
             ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
         ]
@@ -2574,11 +2625,16 @@ class DictEngine:
 
 
 def solve_value_beam(
-    puzzle: Puzzle, *, beam_w: int = 140, max_steps: int = 40
+    puzzle: Puzzle,
+    *,
+    beam_w: int = 160,
+    max_steps: int = 44,
+    local_ctx: Optional[int] = None,
+    use_univ: bool = True,
 ) -> Optional[list[Instruction]]:
     """
-    Run C99 64-bit 2-step lookahead Value-Set Beam Search on small/medium puzzles
-    (`vl <= 25M`, `<= 15` targets) and compile its acyclic DAG into `Instruction`s.
+    Run C99 64-bit 2-step + Dictionary-Guided Value-Set Beam Search on small/medium puzzles
+    and compile its acyclic DAG into `Instruction`s.
     """
     seeds = sorted(set(puzzle.seeds))
     targets = sorted(set(puzzle.targets) - set(seeds))
@@ -2587,7 +2643,7 @@ def solve_value_beam(
     if (
         puzzle.value_limit >= (1 << 63)
         or not seeds
-        or len(seeds) >= 95
+        or len(seeds) >= 118
         or len(targets) > 31
         or any(t <= 0 or t > puzzle.value_limit for t in targets)
     ):
@@ -2604,12 +2660,14 @@ def solve_value_beam(
     out_b = (ctypes.c_uint64 * max_steps)()
     out_r = (ctypes.c_uint64 * max_steps)()
 
+    univ_p = _UNIV_CTX if use_univ else None
     k = int(
         clib.fe_value_beam64(
             s_arr, len(seeds),
             t_arr, len(targets),
             ctypes.c_uint64(puzzle.value_limit),
             int(beam_w), int(max_steps),
+            local_ctx, univ_p,
             out_op, out_a, out_b, out_r,
         )
     )

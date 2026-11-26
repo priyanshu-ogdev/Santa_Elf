@@ -920,6 +920,88 @@ def _schedule_min_live(
     return sched
 
 
+def _emergency_compile(
+    puzzle: Puzzle,
+    defs: dict[int, tuple[str, int, int]],
+    height: dict[int, int],
+) -> list[Instruction]:
+    """
+    Crash-proof low-pressure Sethi-Ullman subtree compiler fallback.
+    Builds targets one-by-one holding only `seeds` + an active evaluation stack
+    so any valid acyclic DAG with <= (registers - 4) seeds always compiles cleanly.
+    """
+    seeds = set(puzzle.seeds)
+    n_regs = puzzle.registers
+    targets = sorted(set(puzzle.targets) - seeds, key=lambda x: (height.get(x, 0), x))
+
+    val_to_reg: dict[int, int] = {}
+    reg_to_val: dict[int, int] = {}
+    seed_regs: set[int] = set()
+    for i, s in enumerate(puzzle.seeds):
+        if s not in val_to_reg:
+            val_to_reg[s] = i
+            reg_to_val[i] = s
+            seed_regs.add(i)
+
+    def _free_reg(protected_regs: set[int]) -> int:
+        for r in range(n_regs - 1, -1, -1):
+            if r not in reg_to_val and r not in protected_regs and r not in seed_regs:
+                return r
+        for r in range(n_regs - 1, -1, -1):
+            if r not in protected_regs and r not in seed_regs:
+                old_v = reg_to_val.pop(r)
+                val_to_reg.pop(old_v, None)
+                return r
+        raise RuntimeError(f"Too many pinned seed registers ({len(seed_regs)}) for {n_regs} regs")
+
+    instructions: list[Instruction] = []
+    tree_sz: dict[int, int] = {}
+
+    def tsize(u: int, vis: set[int]) -> int:
+        if u in seeds or u in val_to_reg:
+            return 0
+        if u in tree_sz:
+            return tree_sz[u]
+        if u in vis:
+            return 1
+        vis.add(u)
+        _, a, b = defs[u]
+        sz = 1 + tsize(a, vis) + (tsize(b, vis) if b != a else 0)
+        tree_sz[u] = sz
+        return sz
+
+    def eval_node(u: int, protected_regs: set[int]) -> int:
+        if u in val_to_reg:
+            return val_to_reg[u]
+        op, a, b = defs[u]
+        if a == b:
+            ra = eval_node(a, protected_regs)
+            dst = _free_reg(protected_regs | {ra})
+            val_to_reg[u] = dst
+            reg_to_val[dst] = u
+            instructions.append(Instruction(op=op, src1=ra, src2=ra, dst=dst))
+            return dst
+        sa = tsize(a, set())
+        sb = tsize(b, set())
+        if sa >= sb:
+            ra = eval_node(a, protected_regs)
+            rb = eval_node(b, protected_regs | {ra})
+            ra = val_to_reg[a] if a in val_to_reg else eval_node(a, protected_regs | {rb})
+        else:
+            rb = eval_node(b, protected_regs)
+            ra = eval_node(a, protected_regs | {rb})
+            rb = val_to_reg[b] if b in val_to_reg else eval_node(b, protected_regs | {ra})
+        dst = _free_reg(protected_regs | {ra, rb})
+        val_to_reg[u] = dst
+        reg_to_val[dst] = u
+        instructions.append(Instruction(op=op, src1=ra, src2=rb, dst=dst))
+        return dst
+
+    for t in targets:
+        eval_node(t, set())
+    return instructions
+
+
 def compile_dag(
     puzzle: Puzzle, defs: dict[int, tuple[str, int, int]], *, n_trials: int = 48
 ) -> list[Instruction]:
@@ -1010,7 +1092,7 @@ def compile_dag(
                     break
 
     if best_prog is None:
-        raise RuntimeError(f"Failed to compile DAG for puzzle {puzzle.id} in {puzzle.registers} regs")
+        return _emergency_compile(puzzle, defs, height)
     return best_prog
 
 # ===========================================================================
@@ -3627,7 +3709,7 @@ EXPORT void fe_screen_smooth(
     }
 }
 
-#define VB_MAX_POOL 96
+#define VB_MAX_POOL 120
 #define VB_K_CHILD  32
 #define VB_SEEN_HT  65536U
 #define VB_SET_HT   65536U
@@ -3794,8 +3876,42 @@ static inline uint64_t vb_hash_arr(const uint64_t *arr, int n) {
     return h ? h : 1ULL;
 }
 
+static inline double vb_dict_cost(const BigDict *d, const BigDict *u, uint64_t x) {
+    if (x == 0ULL || x >= (1ULL << 24)) return 1e9;
+    if (d && d->seen24 && (d->seen24[x >> 6] & (1ULL << (x & 63)))) {
+        int32_t id = bd_find(d, x);
+        if (id >= 0) return 1.5 + 1.0 * (double)meta_cost(d->meta[id]);
+    }
+    if (u && u->seen24 && (u->seen24[x >> 6] & (1ULL << (x & 63)))) {
+        int32_t iu = bd_find(u, x);
+        if (iu >= 0) return 2.5 + 1.0 * (double)meta_cost(u->meta[iu]);
+    }
+    return 1e9;
+}
+
+static inline double vb_dict_pair_ctg(const BigDict *d, const BigDict *u, uint64_t t, uint64_t x, uint64_t vl) {
+    if (!d && !u) return 1e9;
+    double best = 1e9, c;
+    if (t > x) { c = vb_dict_cost(d, u, t - x); if (c < best) best = c; }
+    else if (x > t) { c = vb_dict_cost(d, u, x - t); if (c < best) best = c; }
+    if (x <= vl - t) { c = vb_dict_cost(d, u, t + x); if (c < best) best = c; }
+    if (x > 1ULL && (t % x == 0ULL)) { c = vb_dict_cost(d, u, t / x); if (c < best) best = c; }
+    if ((u128)t * (u128)x <= (u128)vl) { c = vb_dict_cost(d, u, t * x); if (c < best) best = c; }
+    if (x > 16ULL && t > x) {
+        uint64_t q = t / x, r = t % x;
+        if (q < (1ULL << 24) && r < (1ULL << 24)) {
+            double cq = vb_dict_cost(d, u, q);
+            if (cq < 1e8) {
+                double cr = (r == 0ULL) ? 0.0 : vb_dict_cost(d, u, r);
+                if (cr < 1e8 && (1.0 + cq + cr < best)) best = 1.0 + cq + cr;
+            }
+        }
+    }
+    return best;
+}
+
 /*
- * C99 64-bit 2-step lookahead Value-Set Beam Search:
+ * C99 64-bit 2-step + Dictionary-Guided Value-Set Beam Search:
  * Discovers non-trivial shared intermediate registers across multiple targets.
  * Returns number of emitted instructions (>0 on success, 0 if unsolved).
  */
@@ -3803,8 +3919,11 @@ EXPORT int fe_value_beam64(
     const uint64_t *seeds, int n_seeds,
     const uint64_t *targets, int n_targets,
     uint64_t vl, int beam_w, int max_steps,
+    void *p_local, void *p_univ,
     uint8_t *out_op, uint64_t *out_a, uint64_t *out_b, uint64_t *out_r
 ) {
+    const BigDict *d = (const BigDict *)p_local;
+    const BigDict *u = (const BigDict *)p_univ;
     if (n_seeds <= 0 || n_targets <= 0 || n_targets > 31) return 0;
     if (n_seeds >= VB_MAX_POOL - 1 || beam_w <= 0 || max_steps <= 0) return 0;
     if (n_seeds + max_steps > VB_MAX_POOL) max_steps = VB_MAX_POOL - n_seeds;
@@ -3912,7 +4031,16 @@ EXPORT int fe_value_beam64(
                     base_can1_mask |= (1U << ti);
                     base_d[ti] = 1.0;
                 } else {
-                    base_d[ti] = 2.0 + 0.25 * (double)bl64(mg);
+                    double b_gap = 2.0 + 0.25 * (double)bl64(mg);
+                    if (d || u) {
+                        double dt = vb_dict_cost(d, u, t);
+                        if (dt < b_gap) b_gap = dt;
+                        for (int i = 0; i < nv; i++) {
+                            double dc = vb_dict_pair_ctg(d, u, t, sv[i], vl);
+                            if (dc < b_gap) b_gap = dc;
+                        }
+                    }
+                    base_d[ti] = b_gap;
                 }
             }
             qsort(reqs, (size_t)n_req, sizeof(VBReq), vb_cmp_req);
@@ -4021,6 +4149,10 @@ EXPORT int fe_value_beam64(
                     } else {
                         uint64_t mg = vb_eval_gap_sv(t, c->x, sv, nv, vl);
                         double dx = 2.0 + 0.25 * (double)bl64(mg);
+                        if (d || u) {
+                            double dc = vb_dict_pair_ctg(d, u, t, c->x, vl);
+                            if (dc < dx) dx = dc;
+                        }
                         sc += (base_d[ti] < dx) ? base_d[ti] : dx;
                     }
                 }
@@ -4229,6 +4361,7 @@ def get_clib() -> Optional[ctypes.CDLL]:
             ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
             ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
             ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
         ]
@@ -4873,11 +5006,16 @@ class DictEngine:
 
 
 def solve_value_beam(
-    puzzle: Puzzle, *, beam_w: int = 140, max_steps: int = 40
+    puzzle: Puzzle,
+    *,
+    beam_w: int = 160,
+    max_steps: int = 44,
+    local_ctx: Optional[int] = None,
+    use_univ: bool = True,
 ) -> Optional[list[Instruction]]:
     """
-    Run C99 64-bit 2-step lookahead Value-Set Beam Search on small/medium puzzles
-    (`vl <= 25M`, `<= 15` targets) and compile its acyclic DAG into `Instruction`s.
+    Run C99 64-bit 2-step + Dictionary-Guided Value-Set Beam Search on small/medium puzzles
+    and compile its acyclic DAG into `Instruction`s.
     """
     seeds = sorted(set(puzzle.seeds))
     targets = sorted(set(puzzle.targets) - set(seeds))
@@ -4886,7 +5024,7 @@ def solve_value_beam(
     if (
         puzzle.value_limit >= (1 << 63)
         or not seeds
-        or len(seeds) >= 95
+        or len(seeds) >= 118
         or len(targets) > 31
         or any(t <= 0 or t > puzzle.value_limit for t in targets)
     ):
@@ -4903,12 +5041,14 @@ def solve_value_beam(
     out_b = (ctypes.c_uint64 * max_steps)()
     out_r = (ctypes.c_uint64 * max_steps)()
 
+    univ_p = _UNIV_CTX if use_univ else None
     k = int(
         clib.fe_value_beam64(
             s_arr, len(seeds),
             t_arr, len(targets),
             ctypes.c_uint64(puzzle.value_limit),
             int(beam_w), int(max_steps),
+            local_ctx, univ_p,
             out_op, out_a, out_b, out_r,
         )
     )
@@ -6129,7 +6269,11 @@ def _milp_polish(
 # ---------------------------------------------------------------------------
 
 def dag_synthesizer_solve(
-    puzzle: Puzzle, *, force_python: bool = False, ram_gb: str | float = "auto"
+    puzzle: Puzzle,
+    *,
+    force_python: bool = False,
+    ram_gb: str | float = "auto",
+    _diag_out: Optional[dict] = None,
 ) -> list[Instruction]:
     """
     Solve `puzzle` using the 6-engine shared-DAG synthesizer, Rip-and-Reroute +
@@ -6384,7 +6528,7 @@ def dag_synthesizer_solve(
                         if len(c_pruned) < len(cur_defs):
                             cur_defs = c_pruned
 
-        # Ensure standalone seed-rooted compact recipes exist in MILP pool for every target
+        # Ensure standalone seed-rooted compact recipes exist in MILP & Column-Gen pools
         seed_sorted = sorted(de.seeds)
         for t in targets:
             if len(cand_recipes[t]) < 4:
@@ -6397,6 +6541,10 @@ def dag_synthesizer_solve(
 
         n_trials = int(de.profile.get("compiler_trials", 64))
         best_prog = remove_dead_ops(puzzle, compile_dag(puzzle, cur_defs, n_trials=n_trials))
+        if len(best_prog) > len(cur_defs) + 6 and n_trials < 256:
+            alt_prog = remove_dead_ops(puzzle, compile_dag(puzzle, cur_defs, n_trials=256))
+            if len(alt_prog) < len(best_prog) and verify_program(puzzle, alt_prog).valid:
+                best_prog = alt_prog
 
         # Bounded HiGHS MILP polish over union of compact recipes
         milp_defs = _milp_polish(
@@ -6414,6 +6562,21 @@ def dag_synthesizer_solve(
                     best_prog = milp_prog
             except Exception:
                 pass
+
+        if _diag_out is not None:
+            regs_t: list[Optional[int]] = [None] * puzzle.registers
+            for idx_s, s_val in enumerate(puzzle.seeds):
+                regs_t[idx_s] = s_val
+            dvals: set[int] = set()
+            for inst in best_prog:
+                va = regs_t[inst.src1]
+                vb = regs_t[inst.src2]
+                rv = apply_op(inst.op, va, vb, puzzle.value_limit) if (va is not None and vb is not None) else None
+                if rv is not None:
+                    regs_t[inst.dst] = rv
+                    if de.has(rv):
+                        dvals.add(rv)
+            _diag_out["dict_vals"] = dvals
 
         return best_prog
 
@@ -6841,12 +7004,21 @@ Usage (programmatic):
 # [bundled]     from src.orchestrator import run
     total_instructions = run("data/puzzles.csv", "submissions/sub_v1.csv")
 """
+import csv
 import os
 import argparse
 import multiprocessing
 import time
+from collections import Counter
 from typing import Optional
-# [bundled] from src.utils import Puzzle, Instruction, load_puzzles, write_submission
+# [bundled] from src.utils import (
+# [bundled-cont]     Puzzle,
+# [bundled-cont]     Instruction,
+# [bundled-cont]     apply_op,
+# [bundled-cont]     load_puzzles,
+# [bundled-cont]     program_from_json,
+# [bundled-cont]     write_submission,
+# [bundled-cont] )
 # [bundled] from src.verifier import verify_program, quick_verify
 # [bundled] from src.classifier import classify, PuzzleClass
 
@@ -6901,6 +7073,183 @@ def find_out_path(preferred: Optional[str] = None) -> str:
 # Per-puzzle solver dispatcher
 # ---------------------------------------------------------------------------
 
+def _attribute_program(
+    puzzle: Puzzle, program: list[Instruction], dict_vals: Optional[set[int]] = None
+) -> dict[str, int]:
+    """Classify each instruction in a valid program into structural attribution buckets."""
+    seeds = set(puzzle.seeds)
+    targets = set(puzzle.targets) - seeds
+    regs: list[Optional[tuple[str, int]]] = [None] * puzzle.registers
+    for i, s in enumerate(puzzle.seeds):
+        regs[i] = ("SEED", s)
+
+    nodes: list[list] = []
+    seen_vals: set[int] = set()
+    hits_seen: set[int] = set(seeds)
+
+    for inst in program:
+        pa = regs[inst.src1]
+        pb = regs[inst.src2]
+        va = pa[1] if (pa is not None and pa[0] == "SEED") else (nodes[pa[1]][0] if pa is not None else 0)
+        vb = pb[1] if (pb is not None and pb[0] == "SEED") else (nodes[pb[1]][0] if pb is not None else 0)
+        val = apply_op(inst.op, va, vb, puzzle.value_limit) or 0
+        is_tgt = (val in targets) and (val not in hits_seen)
+        if is_tgt:
+            hits_seen.add(val)
+        is_one = (inst.op == "/" and va == vb and val == 1)
+        nid = len(nodes)
+        nodes.append([val, pa, pb, is_tgt, 0, is_one])
+        seen_vals.add(val)
+        regs[inst.dst] = ("STEP", nid)
+
+    for node in nodes:
+        for par in (node[1], node[2]):
+            if par is not None and par[0] == "STEP":
+                nodes[par[1]][4] += 1
+
+    counts = {
+        "make_one": 0,
+        "target_leaf": 0,
+        "shared_hub": 0,
+        "dict_anc": 0,
+        "glue": 0,
+        "remat": max(0, len(nodes) - len(seen_vals)),
+        "ops": len(nodes),
+        "tgts": len(targets),
+    }
+    dvals = dict_vals or set()
+    for val, _, _, is_tgt, out_deg, is_one in nodes:
+        if is_one:
+            counts["make_one"] += 1
+        elif is_tgt and out_deg == 0:
+            counts["target_leaf"] += 1
+        elif out_deg >= 2:
+            counts["shared_hub"] += 1
+        elif val in dvals:
+            counts["dict_anc"] += 1
+        else:
+            counts["glue"] += 1
+    return counts
+
+
+def _solve_puzzle_with_telemetry(
+    puzzle: Puzzle,
+    *,
+    sa_time: float = 0.0,
+    n_starts: int = 2,
+    ram_gb: str | float = "auto",
+    verbose: bool = False,
+) -> tuple[list[Instruction], dict]:
+    """Run solver portfolio and return `(best_program, telemetry_info)`."""
+# [bundled]     from src.solvers import fallback, tiny_bfs, meet_in_middle, delta_cluster, factor_smooth
+# [bundled]     from src.solvers import binary_shared, dag_synthesizer
+# [bundled]     from src.postpass import postprocess
+
+    label = classify(puzzle)
+    candidates: list[tuple[str, list[Instruction]]] = []
+    warnings: list[str] = []
+    dag_diag: dict = {}
+
+    # --- Fallback (always — guaranteed valid ceiling) ---
+    fb_prog = fallback.solve(puzzle)
+    r = verify_program(puzzle, fb_prog)
+    if r.valid:
+        candidates.append(("fallback", fb_prog))
+
+    # --- Tiny exact solver ---
+    if puzzle.value_limit < 200 or label == PuzzleClass.TINY:
+        try:
+            prog = tiny_bfs.solve(puzzle)
+            if verify_program(puzzle, prog).valid:
+                candidates.append(("tiny_bfs", prog))
+        except Exception as e:
+            warnings.append(f"tiny_bfs failed on {puzzle.id}: {e!r}")
+
+    # --- dag_synthesizer (PRIMARY: High-RAM Shared U + 6-engine DAG + Pair-Rip + MILP) ---
+    if puzzle.value_limit >= 40:
+        try:
+            prog = dag_synthesizer.solve(puzzle, ram_gb=ram_gb, _diag_out=dag_diag)
+            r = verify_program(puzzle, prog)
+            if r.valid:
+                candidates.append(("dag_synthesizer", prog))
+            else:
+                warnings.append(f"dag_synthesizer invalid on {puzzle.id}: {r.error}")
+        except Exception as e:
+            warnings.append(f"dag_synthesizer failed on {puzzle.id}: {e!r}")
+
+    # --- C99 2-step + Dictionary-Guided Value-Set Beam Search (small/medium <=100M, <=20t) ---
+    if 40 <= puzzle.value_limit and puzzle.targets and max(puzzle.targets) <= 100_000_000 and len(puzzle.targets) <= 20:
+        try:
+# [bundled]             from src.solvers.fast_engine import solve_value_beam
+            vb_lim = min(puzzle.value_limit, max(25_000_000, max(puzzle.targets) * 4))
+            vb_puzzle = puzzle if vb_lim == puzzle.value_limit else Puzzle(puzzle.id, puzzle.seeds, puzzle.targets, vb_lim)
+            vb_prog = solve_value_beam(vb_puzzle, beam_w=240, max_steps=72, use_univ=True)
+            if vb_prog is not None and verify_program(puzzle, vb_prog).valid:
+                candidates.append(("solve_value_beam", vb_prog))
+        except Exception as e:
+            warnings.append(f"solve_value_beam failed on {puzzle.id}: {e!r}")
+
+    # --- binary_shared (secondary safety net only when primary solvers produced nothing) ---
+    if len(candidates) <= 1:
+        try:
+            prog = binary_shared.solve(puzzle)
+            r = verify_program(puzzle, prog)
+            if r.valid:
+                candidates.append(("binary_shared", prog))
+        except Exception as e:
+            warnings.append(f"binary_shared failed on {puzzle.id}: {e!r}")
+
+    # --- Specialised small-range solvers (fast path for < 10^7 targets) ---
+    if max(puzzle.targets) < 10**7 and label != PuzzleClass.TINY:
+        try:
+            s_name = "meet_in_middle"
+            prog = None
+            if label == PuzzleClass.SMOOTH:
+                s_name = "factor_smooth"
+                prog = factor_smooth.solve(puzzle)
+            elif label == PuzzleClass.CLUSTERED:
+                s_name = "delta_cluster"
+                prog = delta_cluster.solve(puzzle)
+            else:
+                prog = meet_in_middle.solve(puzzle)
+            if prog is not None and verify_program(puzzle, prog).valid:
+                candidates.append((s_name, prog))
+        except Exception:
+            pass
+
+        for seed in range(n_starts):
+            try:
+                prog = meet_in_middle.solve(puzzle, random_seed=seed)
+                if verify_program(puzzle, prog).valid:
+                    candidates.append(("meet_in_middle", prog))
+            except Exception:
+                pass
+
+    if not candidates:
+        raise RuntimeError(f"All solvers failed for puzzle {puzzle.id}")
+
+    # Pick shortest so far
+    winner, best = min(candidates, key=lambda pair: len(pair[1]))
+
+    # --- Post-processing ---
+    try:
+        improved = postprocess(puzzle, best, run_annealing=(sa_time > 0),
+                               annealing_budget=sa_time)
+        ok, count, err = quick_verify(puzzle, improved)
+        if ok:
+            best = improved
+    except Exception as e:
+        warnings.append(f"postprocess failed on {puzzle.id}: {e!r}")
+
+    if verbose:
+        for w in warnings:
+            print(f"  [warn] {w}", flush=True)
+        print(f"  {puzzle.id} [{label.name}|{winner}]: {len(best)} instructions")
+
+    attr = _attribute_program(puzzle, best, dag_diag.get("dict_vals"))
+    return best, {"winner": winner, "warnings": warnings, "attr": attr}
+
+
 def solve_puzzle(
     puzzle: Puzzle,
     *,
@@ -6911,113 +7260,10 @@ def solve_puzzle(
 ) -> list[Instruction]:
     """
     Run the full solver portfolio for one puzzle. Returns the best valid program.
-
-    Portfolio (in priority order):
-      1. tiny_bfs        — exact bounded best-first search for value_limit < 100
-      2. dag_synthesizer — 5-engine shared DAG + BPE + C99/Py two-pointer + MILP + Sethi-Ullman compiler (PRIMARY)
-      3. binary_shared   — fast wNAF ensemble (secondary safety baseline)
-      4. fallback        — simple binary construction (guaranteed valid ceiling)
-      5. Specialised M-i-M / cluster / smooth solvers for small/medium targets
-      6. Post-processing: dead-op removal + live-pool peephole + optional SA
     """
-# [bundled]     from src.solvers import fallback, tiny_bfs, meet_in_middle, delta_cluster, factor_smooth
-# [bundled]     from src.solvers import binary_shared, dag_synthesizer
-# [bundled]     from src.postpass import postprocess
-
-    label = classify(puzzle)
-    candidates: list[list[Instruction]] = []
-
-    # --- Fallback (always — guaranteed valid ceiling) ---
-    fb_prog = fallback.solve(puzzle)
-    r = verify_program(puzzle, fb_prog)
-    if r.valid:
-        candidates.append(fb_prog)
-
-    # --- Tiny exact solver ---
-    if puzzle.value_limit < 200 or label == PuzzleClass.TINY:
-        try:
-            prog = tiny_bfs.solve(puzzle)
-            if verify_program(puzzle, prog).valid:
-                candidates.append(prog)
-        except Exception:
-            pass
-
-    # --- dag_synthesizer (PRIMARY: High-RAM Shared U + 6-engine DAG + Pair-Rip + MILP) ---
-    if puzzle.value_limit >= 40:
-        try:
-            prog = dag_synthesizer.solve(puzzle, ram_gb=ram_gb)
-            r = verify_program(puzzle, prog)
-            if r.valid:
-                candidates.append(prog)
-        except Exception as e:
-            if verbose:
-                print(f"  [warn] dag_synthesizer failed on {puzzle.id}: {e!r}", flush=True)
-
-    # --- C99 2-step Value-Set Beam Search (joint intermediate sharing for small/medium ranges) ---
-    if 40 <= puzzle.value_limit and puzzle.targets and max(puzzle.targets) <= 25_000_000 and len(puzzle.targets) <= 15:
-        try:
-# [bundled]             from src.solvers.fast_engine import solve_value_beam
-            vb_lim = min(puzzle.value_limit, max(25_000_000, max(puzzle.targets) * 4))
-            vb_puzzle = puzzle if vb_lim == puzzle.value_limit else Puzzle(puzzle.id, puzzle.seeds, puzzle.targets, vb_lim)
-            vb_prog = solve_value_beam(vb_puzzle, beam_w=160, max_steps=44)
-            if vb_prog is not None and verify_program(puzzle, vb_prog).valid:
-                candidates.append(vb_prog)
-        except Exception:
-            pass
-
-    # --- binary_shared (secondary wNAF safety net — skip when DAG already beats 55% bit-budget) ---
-    bit_thresh = max(40, (sum(t.bit_length() for t in puzzle.targets) * 55) // 100)
-    if not candidates or min(len(c) for c in candidates) > bit_thresh:
-        try:
-            prog = binary_shared.solve(puzzle)
-            r = verify_program(puzzle, prog)
-            if r.valid:
-                candidates.append(prog)
-        except Exception:
-            pass
-
-    # --- Specialised small-range solvers (fast path for < 10^7 targets) ---
-    if max(puzzle.targets) < 10**7 and label != PuzzleClass.TINY:
-        try:
-            prog = None
-            if label == PuzzleClass.SMOOTH:
-                prog = factor_smooth.solve(puzzle)
-            elif label == PuzzleClass.CLUSTERED:
-                prog = delta_cluster.solve(puzzle)
-            else:
-                prog = meet_in_middle.solve(puzzle)
-            if prog is not None and verify_program(puzzle, prog).valid:
-                candidates.append(prog)
-        except Exception:
-            pass
-
-        for seed in range(n_starts):
-            try:
-                prog = meet_in_middle.solve(puzzle, random_seed=seed)
-                if verify_program(puzzle, prog).valid:
-                    candidates.append(prog)
-            except Exception:
-                pass
-
-    if not candidates:
-        raise RuntimeError(f"All solvers failed for puzzle {puzzle.id}")
-
-    # Pick shortest so far
-    best = min(candidates, key=len)
-
-    # --- Post-processing ---
-    try:
-        improved = postprocess(puzzle, best, run_annealing=(sa_time > 0),
-                               annealing_budget=sa_time)
-        ok, count, err = quick_verify(puzzle, improved)
-        if ok:
-            best = improved
-    except Exception:
-        pass
-
-    if verbose:
-        print(f"  {puzzle.id} [{label.name}]: {len(best)} instructions")
-
+    best, _ = _solve_puzzle_with_telemetry(
+        puzzle, sa_time=sa_time, n_starts=n_starts, ram_gb=ram_gb, verbose=verbose
+    )
     return best
 
 
@@ -7025,19 +7271,46 @@ def solve_puzzle(
 # Worker function for multiprocessing
 # ---------------------------------------------------------------------------
 
-def _worker(args: tuple) -> tuple[str, list[list], int]:
+def _worker(args: tuple) -> tuple[str, list[list], int, dict]:
     """
-    Multiprocessing worker. Returns (puzzle_id, program_as_list_of_lists, count).
+    Multiprocessing worker. Returns (puzzle_id, program_as_list_of_lists, count, info).
     """
     puzzle, sa_time, n_starts, ram_gb, verbose = args
     try:
-        prog = solve_puzzle(puzzle, sa_time=sa_time, n_starts=n_starts, ram_gb=ram_gb, verbose=verbose)
-        return puzzle.id, [inst.to_list() for inst in prog], len(prog)
+        prog, info = _solve_puzzle_with_telemetry(
+            puzzle, sa_time=sa_time, n_starts=n_starts, ram_gb=ram_gb, verbose=verbose
+        )
+        return puzzle.id, [inst.to_list() for inst in prog], len(prog), info
     except Exception as e:
-        # Emergency: use fallback
 # [bundled]         from src.solvers import fallback
         prog = fallback.solve(puzzle)
-        return puzzle.id, [inst.to_list() for inst in prog], len(prog)
+        info = {
+            "winner": "fallback",
+            "warnings": [f"worker crash on {puzzle.id}: {e!r}"],
+            "attr": _attribute_program(puzzle, prog),
+        }
+        return puzzle.id, [inst.to_list() for inst in prog], len(prog), info
+
+
+def _load_verified_archive(
+    archive_path: Optional[str], puzzle_map: dict[str, Puzzle]
+) -> dict[str, list[Instruction]]:
+    """Load verified programs from an existing archive CSV (skipping missing/invalid rows)."""
+    archived: dict[str, list[Instruction]] = {}
+    if not archive_path or not os.path.exists(archive_path):
+        return archived
+    try:
+        with open(archive_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                pid = row.get("id", "")
+                if pid in puzzle_map:
+                    prog = program_from_json(row["program"])
+                    if verify_program(puzzle_map[pid], prog).valid:
+                        if pid not in archived or len(prog) < len(archived[pid]):
+                            archived[pid] = prog
+    except Exception:
+        pass
+    return archived
 
 
 # ---------------------------------------------------------------------------
@@ -7052,6 +7325,7 @@ def run(
     sa_time: float = 0.0,
     n_starts: int = 2,
     ram_gb: str | float = "auto",
+    archive_path: Optional[str] = None,
     verbose: bool = True,
 ) -> int:
     """
@@ -7062,6 +7336,8 @@ def run(
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     puzzles = load_puzzles(puzzles_path)
+    puzzle_map = {p.id: p for p in puzzles}
+    archived = _load_verified_archive(archive_path, puzzle_map)
     total_start = time.monotonic()
 
     # Pre-warm C99 acceleration + Shared Universal `{1}`-Dict U BEFORE fork()
@@ -7097,18 +7373,54 @@ def run(
         if verbose:
             print(f"Warning: C99 universal dict init failed ({e!r}); falling back to Python.", flush=True)
 
+    # Longest-Processing-Time (LPT) dispatch eliminates multi-core tail stragglers
+    work_puzzles = sorted(
+        puzzles,
+        key=lambda p: (
+            -len(set(p.targets) - set(p.seeds)),
+            -max((t.bit_length() for t in p.targets), default=0),
+            -p.value_limit.bit_length(),
+            p.id,
+        ),
+    )
+
     if verbose:
-        print(f"Loaded {len(puzzles)} puzzles. Solving with {cores} core(s) [{backend_name}]...", flush=True)
+        arch_note = f" | archive={len(archived)} loaded" if archive_path else ""
+        print(f"Loaded {len(puzzles)} puzzles. Solving with {cores} core(s) [{backend_name}]{arch_note}...", flush=True)
 
     # Build arguments for workers
-    worker_args = [(p, sa_time, n_starts, ram_gb, verbose and cores == 1) for p in puzzles]
+    worker_args = [(p, sa_time, n_starts, ram_gb, verbose and cores == 1) for p in work_puzzles]
 
     results: dict[str, list[Instruction]] = {}
     running_total = 0
+    win_counts: Counter[str] = Counter()
+    attr_tot: Counter[str] = Counter()
+    total_warns = 0
+    arch_wins = 0
 
-    def _log_progress(pid: str, count: int) -> None:
-        nonlocal running_total
+    def _record_result(pid: str, prog: list[Instruction], info_d: dict) -> None:
+        nonlocal running_total, total_warns, arch_wins
+        prev = archived.get(pid)
+        if prev is not None and len(prev) < len(prog):
+            prog = prev
+            arch_wins += 1
+            win_counts["archive_kept"] += 1
+        else:
+            win_counts[info_d.get("winner", "unknown")] += 1
+        results[pid] = prog
+        count = len(prog)
         running_total += count
+
+        warns = info_d.get("warnings") or []
+        total_warns += len(warns)
+        if verbose and cores > 1:
+            for w in warns:
+                print(f"  [warn] {w}", flush=True)
+
+        attr = info_d.get("attr") or {}
+        for k, val in attr.items():
+            attr_tot[k] += val
+
         if not verbose:
             return
         done = len(results)
@@ -7132,34 +7444,51 @@ def run(
         try:
             mp_ctx = multiprocessing.get_context("fork") if os.name != "nt" else multiprocessing.get_context()
             with mp_ctx.Pool(processes=cores) as pool:
-                for pid, prog_lists, count in pool.imap_unordered(_worker, worker_args, chunksize=1):
-# [bundled]                     from src.utils import Instruction
-                    results[pid] = [Instruction(*row) for row in prog_lists]
-                    _log_progress(pid, count)
+                for pid, prog_lists, _, info_d in pool.imap_unordered(_worker, worker_args, chunksize=1):
+                    _record_result(pid, [Instruction(*row) for row in prog_lists], info_d)
         except Exception as e:
             if verbose:
                 print(f"Worker pool encountered {e}; executing remaining on main process...", flush=True)
-            for puzzle in puzzles:
+            for puzzle in work_puzzles:
                 if puzzle.id not in results:
-                    pid, prog_lists, count = _worker((puzzle, sa_time, n_starts, ram_gb, verbose))
-# [bundled]                     from src.utils import Instruction
-                    results[pid] = [Instruction(*row) for row in prog_lists]
-                    _log_progress(pid, count)
+                    pid, prog_lists, _, info_d = _worker((puzzle, sa_time, n_starts, ram_gb, verbose))
+                    _record_result(pid, [Instruction(*row) for row in prog_lists], info_d)
     else:
-        for puzzle in puzzles:
-            pid, prog_lists, count = _worker((puzzle, sa_time, n_starts, ram_gb, verbose))
-# [bundled]             from src.utils import Instruction
-            results[pid] = [Instruction(*row) for row in prog_lists]
-            _log_progress(pid, count)
+        for puzzle in work_puzzles:
+            pid, prog_lists, _, info_d = _worker((puzzle, sa_time, n_starts, ram_gb, verbose))
+            _record_result(pid, [Instruction(*row) for row in prog_lists], info_d)
 
-    # Write submission
+    # Write submission (and update monotonic best-of archive if enabled)
     write_submission(results, out_path)
+    if archive_path:
+        merged = dict(archived)
+        for pid, prog in results.items():
+            if pid not in merged or len(prog) < len(merged[pid]):
+                merged[pid] = prog
+        os.makedirs(os.path.dirname(os.path.abspath(archive_path)), exist_ok=True)
+        write_submission(merged, archive_path)
+
     total = sum(len(v) for v in results.values())
     elapsed = time.monotonic() - total_start
 
     if verbose:
         print(f"\nTotal instructions: {total:,}")
         print(f"Elapsed: {elapsed:.1f}s")
+        print(f"Solver wins: {dict(win_counts)} | Warnings: {total_warns}")
+        if arch_wins:
+            print(f"Best-of archive preserved shorter valid programs for {arch_wins} puzzles.")
+        ops_sum = max(1, attr_tot.get("ops", 0))
+        tgts_sum = max(1, attr_tot.get("tgts", 0))
+        print(
+            "Attribution summary "
+            f"({tgts_sum:,} targets, {ops_sum:,} ops, {ops_sum / tgts_sum:.2f} ops/tgt): "
+            f"dict_anc={attr_tot['dict_anc']:,} ({attr_tot['dict_anc']/ops_sum*100:.1f}%), "
+            f"shared_hub={attr_tot['shared_hub']:,} ({attr_tot['shared_hub']/ops_sum*100:.1f}%), "
+            f"glue={attr_tot['glue']:,} ({attr_tot['glue']/ops_sum*100:.1f}%), "
+            f"target_leaf={attr_tot['target_leaf']:,} ({attr_tot['target_leaf']/ops_sum*100:.1f}%), "
+            f"make_one={attr_tot['make_one']:,} ({attr_tot['make_one']/ops_sum*100:.1f}%), "
+            f"remat={attr_tot['remat']:,} ({attr_tot['remat']/ops_sum*100:.1f}%)"
+        )
         print(f"Submission written to: {out_path}")
 
     return total
@@ -7197,6 +7526,7 @@ def _cli():
     parser.add_argument("--sa-time",  type=float, default=0.0, help="Optional extra SA time budget per puzzle (s)")
     parser.add_argument("--n-starts", type=int, default=2, help="M-i-M random restarts per small puzzle")
     parser.add_argument("--ram-gb",   default="auto", help="RAM budget profile in GB ('auto' uses full Kaggle 20-24 GB)")
+    parser.add_argument("--archive",  default=None, help="Optional monotonic best-of archive CSV path")
     parser.add_argument("--verify",   action="store_true", default=True, help="Run full re-verification after solving")
 
     if is_notebook:
@@ -7213,6 +7543,8 @@ def _cli():
     print("Santa 2026: The Elf Calculator Solver")
     print(f"  Puzzles source : {puzzles_path}")
     print(f"  Submission out : {out_path}")
+    if args.archive:
+        print(f"  Archive CSV    : {args.archive}")
     print(f"  Workers        : {args.cores}")
     print(f"  RAM profile    : {args.ram_gb}")
     print(f"  SA time/puzzle : {args.sa_time}s")
@@ -7224,6 +7556,7 @@ def _cli():
         sa_time=args.sa_time,
         n_starts=args.n_starts,
         ram_gb=args.ram_gb,
+        archive_path=args.archive,
         verbose=True,
     )
 

@@ -1198,7 +1198,11 @@ def _milp_polish(
 # ---------------------------------------------------------------------------
 
 def solve(
-    puzzle: Puzzle, *, force_python: bool = False, ram_gb: str | float = "auto"
+    puzzle: Puzzle,
+    *,
+    force_python: bool = False,
+    ram_gb: str | float = "auto",
+    _diag_out: Optional[dict] = None,
 ) -> list[Instruction]:
     """
     Solve `puzzle` using the 6-engine shared-DAG synthesizer, Rip-and-Reroute +
@@ -1453,7 +1457,7 @@ def solve(
                         if len(c_pruned) < len(cur_defs):
                             cur_defs = c_pruned
 
-        # Ensure standalone seed-rooted compact recipes exist in MILP pool for every target
+        # Ensure standalone seed-rooted compact recipes exist in MILP & Column-Gen pools
         seed_sorted = sorted(de.seeds)
         for t in targets:
             if len(cand_recipes[t]) < 4:
@@ -1466,6 +1470,10 @@ def solve(
 
         n_trials = int(de.profile.get("compiler_trials", 64))
         best_prog = remove_dead_ops(puzzle, compile_dag(puzzle, cur_defs, n_trials=n_trials))
+        if len(best_prog) > len(cur_defs) + 6 and n_trials < 256:
+            alt_prog = remove_dead_ops(puzzle, compile_dag(puzzle, cur_defs, n_trials=256))
+            if len(alt_prog) < len(best_prog) and verify_program(puzzle, alt_prog).valid:
+                best_prog = alt_prog
 
         # Bounded HiGHS MILP polish over union of compact recipes
         milp_defs = _milp_polish(
@@ -1483,5 +1491,20 @@ def solve(
                     best_prog = milp_prog
             except Exception:
                 pass
+
+        if _diag_out is not None:
+            regs_t: list[Optional[int]] = [None] * puzzle.registers
+            for idx_s, s_val in enumerate(puzzle.seeds):
+                regs_t[idx_s] = s_val
+            dvals: set[int] = set()
+            for inst in best_prog:
+                va = regs_t[inst.src1]
+                vb = regs_t[inst.src2]
+                rv = apply_op(inst.op, va, vb, puzzle.value_limit) if (va is not None and vb is not None) else None
+                if rv is not None:
+                    regs_t[inst.dst] = rv
+                    if de.has(rv):
+                        dvals.add(rv)
+            _diag_out["dict_vals"] = dvals
 
         return best_prog
