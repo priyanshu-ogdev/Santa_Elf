@@ -1050,6 +1050,37 @@ def _synthesize_best_marginal(
                         + [(op_r, prod, gap, v)]
                     )
 
+    # 8b. C99 Dynamic Active-Pair Bridge (E = a OP b; T ~ E +- gap | E*q +- gap | E*d +- gap)
+    if depth >= 2 and v > 100 and len(active_sorted) >= 2:
+        ap_hits = de.act_probe(v, active_sorted, K=12)
+        seen_ap: set[tuple[int, int]] = set()
+        ap_rec = 0
+        for op_ab, ax, bx, comb, mul_d, prod, gap, sgn, _ in ap_hits:
+            if (comb, prod) in seen_ap:
+                continue
+            seen_ap.add((comb, prod))
+            op_r = "+" if sgn == 1 else "-"
+            if mul_d == 1:
+                sub_ap = [] if comb in active_set else [(op_ab, ax, bx, comb)]
+            elif prod in active_set or prod in seeds:
+                sub_ap = []
+            else:
+                sub_ap = ([] if comb in active_set else [(op_ab, ax, bx, comb)]) + [("*", comb, mul_d, prod)]
+            if gap == 0:
+                if sub_ap:
+                    consider_ops(sub_ap)
+            elif gap in active_set or de.has(gap):
+                consider_ops(sub_ap + [(op_r, prod, gap, v)])
+            elif gap < (1 << 28) and ap_rec < 3:
+                ap_rec += 1
+                g_added = _synthesize_best_marginal(gap, active_defs, active_sorted, de, depth=1)
+                if g_added is not None:
+                    consider_ops(
+                        list(sub_ap)
+                        + [(op, gx, gy, gr) for gr, (op, gx, gy) in g_added.items()]
+                        + [(op_r, prod, gap, v)]
+                    )
+
     return best_added
 
 
@@ -1479,6 +1510,7 @@ def solve(
         has_univ = de.univ_ctx is not None
         univ_modes = (True, False) if has_univ else (True,)
         best_defs: Optional[dict[int, tuple[str, int, int]]] = None
+        alt_init_defs: Optional[dict[int, tuple[str, int, int]]] = None
         best_univ: bool = True
         cand_recipes: dict[int, list[dict[int, tuple[str, int, int]]]] = defaultdict(list)
 
@@ -1516,8 +1548,14 @@ def solve(
                 if all(t in active_defs or t in seeds_set for t in targets):
                     pruned_act = prune_dag(active_defs)
                     if best_defs is None or len(pruned_act) < len(best_defs):
+                        if best_defs is not None and len(best_defs) <= len(pruned_act) + 10:
+                            alt_init_defs = best_defs
                         best_defs = pruned_act
                         best_univ = allow_u
+                    elif pruned_act != best_defs and (
+                        alt_init_defs is None or len(pruned_act) < len(alt_init_defs)
+                    ):
+                        alt_init_defs = pruned_act
 
         if best_defs is None:
             from src.solvers import binary_shared
@@ -1560,6 +1598,8 @@ def solve(
             if not improved:
                 break
 
+        pre_pair_defs = dict(cur_defs)
+
         # 2-Target Pair Rip-and-Reroute LNS (escapes locked shared local minima)
         ts_by_bits = sorted(targets, key=lambda x: (x.bit_length(), x))
         pair_budget = min(len(ts_by_bits) - 1, 20)
@@ -1594,6 +1634,8 @@ def solve(
                     if len(c_pruned) < len(cur_defs):
                         cur_defs = c_pruned
 
+        pre_block_defs = dict(cur_defs)
+
         # Bridge-Releasing Subtree-Cluster Block-LNS (unlocks bridge targets frozen in single/pair Rip!)
         if len(targets) >= 3:
             val_users: dict[int, set[int]] = defaultdict(set)
@@ -1612,8 +1654,7 @@ def solve(
 
             seen_clusters: set[frozenset[int]] = set()
             cluster_cands: list[tuple[int, list[int]]] = []
-            for t in targets:
-                cl = val_users.get(t, {t})
+            for cl in val_users.values():
                 if 2 <= len(cl) <= 5:
                     fs = frozenset(cl)
                     if fs not in seen_clusters:
@@ -1692,10 +1733,20 @@ def solve(
 
         n_trials = int(de.profile.get("compiler_trials", 64))
         best_prog = remove_dead_ops(puzzle, compile_dag(puzzle, cur_defs, n_trials=n_trials))
-        if len(best_prog) > len(cur_defs) + 6 and n_trials < 256:
-            alt_prog = remove_dead_ops(puzzle, compile_dag(puzzle, cur_defs, n_trials=256))
-            if len(alt_prog) < len(best_prog) and verify_program(puzzle, alt_prog).valid:
-                best_prog = alt_prog
+        if len(best_prog) > len(cur_defs) + 6:
+            tested_dags = [cur_defs]
+            for alt_d in (pre_block_defs, pre_pair_defs, alt_init_defs):
+                if alt_d is None or len(alt_d) >= len(best_prog):
+                    continue
+                if any(alt_d == td for td in tested_dags):
+                    continue
+                tested_dags.append(alt_d)
+                try:
+                    alt_prog = remove_dead_ops(puzzle, compile_dag(puzzle, alt_d, n_trials=n_trials))
+                    if len(alt_prog) < len(best_prog) and verify_program(puzzle, alt_prog).valid:
+                        best_prog = alt_prog
+                except Exception:
+                    pass
 
         # Bounded HiGHS MILP polish over union of compact recipes
         milp_defs = _milp_polish(
@@ -1706,7 +1757,7 @@ def solve(
             max_edges=int(de.profile.get("milp_max_edges", 3500)),
             time_limit=float(de.profile.get("milp_time", 2.0)),
         )
-        if milp_defs is not None:
+        if milp_defs is not None and milp_defs != cur_defs and len(milp_defs) < len(best_prog):
             try:
                 milp_prog = remove_dead_ops(puzzle, compile_dag(puzzle, milp_defs, n_trials=n_trials))
                 if len(milp_prog) < len(best_prog) and verify_program(puzzle, milp_prog).valid:

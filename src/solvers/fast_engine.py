@@ -1305,6 +1305,362 @@ EXPORT int fe_find_active_1ops(
     return nh;
 }
 
+typedef struct {
+    uint64_t v;
+    uint64_t a;
+    uint64_t b;
+    uint8_t  op; /* 1='+', 2='-', 3='*' */
+} ActPair;
+
+typedef struct {
+    ActPair *items;
+    uint32_t n;
+    uint64_t vl;
+} ActPairSet;
+
+static int cmp_ap(const void *x, const void *y) {
+    const ActPair *px = (const ActPair *)x, *py = (const ActPair *)y;
+    if (px->v != py->v) return (px->v < py->v) ? -1 : 1;
+    if (px->op != py->op) return (px->op > py->op) ? -1 : 1;
+    return (px->a < py->a) ? -1 : (px->a > py->a) ? 1 : 0;
+}
+
+static void radix_sort_ap(ActPair *a, uint32_t n) {
+    if (n <= 1U) return;
+    if (n <= 1024U) { qsort(a, n, sizeof(ActPair), cmp_ap); return; }
+    ActPair *tmp = (ActPair *)malloc((size_t)n * sizeof(ActPair));
+    if (!tmp) { qsort(a, n, sizeof(ActPair), cmp_ap); return; }
+    ActPair *src = a, *dst = tmp;
+    uint32_t cnt[256], off[256];
+    for (int shift = 0; shift < 64; shift += 8) {
+        memset(cnt, 0, sizeof(cnt));
+        for (uint32_t i = 0; i < n; i++) cnt[(src[i].v >> shift) & 255U]++;
+        uint32_t fb = (uint32_t)((src[0].v >> shift) & 255U);
+        if (cnt[fb] == n) continue;
+        uint32_t sum = 0U;
+        for (int b = 0; b < 256; b++) { off[b] = sum; sum += cnt[b]; }
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t b = (uint32_t)((src[i].v >> shift) & 255U);
+            dst[off[b]++] = src[i];
+        }
+        ActPair *sw = src; src = dst; dst = sw;
+    }
+    if (src != a) memcpy(a, src, (size_t)n * sizeof(ActPair));
+    free(tmp);
+}
+
+static inline int act_bsearch_has(const uint64_t *arr, int n, uint64_t val) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = lo + ((hi - lo) >> 1);
+        uint64_t mv = arr[mid];
+        if (mv == val) return 1;
+        if (mv < val) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return 0;
+}
+
+EXPORT void fe_act_pairs_free(void *p) {
+    ActPairSet *ap = (ActPairSet *)p;
+    if (!ap) return;
+    free(ap->items);
+    free(ap);
+}
+
+EXPORT void* fe_act_pairs_create(const uint64_t *act, int na, uint64_t vl) {
+    if (!act || na < 2 || vl < 2ULL) return NULL;
+    if (na > 220) na = 220;
+    uint32_t cap = (uint32_t)na * (uint32_t)na * 2U + 64U;
+    ActPair *raw = (ActPair *)malloc((size_t)cap * sizeof(ActPair));
+    if (!raw) return NULL;
+    uint32_t cnt = 0U;
+    u128 vl128 = (u128)vl;
+
+    for (int i = 0; i < na; i++) {
+        uint64_t a = act[i];
+        if (a == 0ULL || a > vl) continue;
+        if (a <= vl - a && (cnt + 1U) < cap) {
+            uint64_t s2 = a + a;
+            if (s2 >= 2ULL) raw[cnt++] = (ActPair){s2, a, a, 1};
+        }
+        if (a > 1ULL && (u128)a * (u128)a <= vl128 && (cnt + 1U) < cap) {
+            uint64_t m2 = a * a;
+            raw[cnt++] = (ActPair){m2, a, a, 3};
+        }
+        for (int j = i + 1; j < na; j++) {
+            uint64_t b = act[j];
+            if (b <= a || b > vl) continue;
+            if (a <= vl - b && (cnt + 1U) < cap) {
+                uint64_t s = a + b;
+                if (s >= 2ULL) raw[cnt++] = (ActPair){s, a, b, 1};
+            }
+            if ((b - a) >= 2ULL && (cnt + 1U) < cap) {
+                raw[cnt++] = (ActPair){b - a, b, a, 2};
+            }
+            if (a > 1ULL && (u128)a * (u128)b <= vl128 && (cnt + 1U) < cap) {
+                raw[cnt++] = (ActPair){a * b, a, b, 3};
+            }
+        }
+    }
+
+    if (cnt == 0U) { free(raw); return NULL; }
+    radix_sort_ap(raw, cnt);
+
+    uint32_t out = 0U;
+    for (uint32_t i = 0U; i < cnt; i++) {
+        uint64_t v = raw[i].v;
+        if (v < 2ULL) continue;
+        if (out > 0U && raw[out - 1U].v == v) continue;
+        if (act_bsearch_has(act, na, v)) continue;
+        raw[out++] = raw[i];
+    }
+    if (out == 0U) { free(raw); return NULL; }
+
+    ActPair *shrunk = (ActPair *)realloc(raw, (size_t)out * sizeof(ActPair));
+    ActPairSet *ap = (ActPairSet *)malloc(sizeof(ActPairSet));
+    if (!ap) { free(shrunk ? shrunk : raw); return NULL; }
+    ap->items = shrunk ? shrunk : raw;
+    ap->n = out;
+    ap->vl = vl;
+    return (void *)ap;
+}
+
+typedef struct {
+    uint64_t a, b, comb, d, prod, gap;
+    int32_t  sc;
+    uint8_t  opab, sgn;
+} ActHit;
+
+static inline void act_push(
+    ActHit *arr, int *n, int *w, int K, uint8_t by_gap,
+    uint8_t opab, uint64_t a, uint64_t b, uint64_t comb,
+    uint64_t d, uint64_t prod, uint64_t gap, uint8_t sgn, int32_t sc
+) {
+    for (int h = 0; h < *n; h++) {
+        if (arr[h].prod == prod && arr[h].comb == comb) {
+            if (sc < arr[h].sc) {
+                arr[h] = (ActHit){a, b, comb, d, prod, gap, sc, opab, sgn};
+                *w = 0;
+                for (int k = 1; k < *n; k++) {
+                    if (by_gap ? (arr[k].gap > arr[*w].gap || (arr[k].gap == arr[*w].gap && arr[k].sc > arr[*w].sc))
+                               : (arr[k].sc > arr[*w].sc || (arr[k].sc == arr[*w].sc && arr[k].gap > arr[*w].gap))) *w = k;
+                }
+            }
+            return;
+        }
+    }
+    if (*n < K) {
+        arr[*n] = (ActHit){a, b, comb, d, prod, gap, sc, opab, sgn};
+        int idx = *n;
+        (*n)++;
+        if (*n == 1) *w = 0;
+        else if (by_gap ? (arr[idx].gap > arr[*w].gap || (arr[idx].gap == arr[*w].gap && arr[idx].sc > arr[*w].sc))
+                        : (arr[idx].sc > arr[*w].sc || (arr[idx].sc == arr[*w].sc && arr[idx].gap > arr[*w].gap))) *w = idx;
+    } else {
+        int repl = by_gap ? (gap < arr[*w].gap || (gap == arr[*w].gap && sc < arr[*w].sc))
+                          : (sc < arr[*w].sc || (sc == arr[*w].sc && gap < arr[*w].gap));
+        if (repl) {
+            arr[*w] = (ActHit){a, b, comb, d, prod, gap, sc, opab, sgn};
+            *w = 0;
+            for (int k = 1; k < *n; k++) {
+                if (by_gap ? (arr[k].gap > arr[*w].gap || (arr[k].gap == arr[*w].gap && arr[k].sc > arr[*w].sc))
+                           : (arr[k].sc > arr[*w].sc || (arr[k].sc == arr[*w].sc && arr[k].gap > arr[*w].gap))) *w = k;
+            }
+        }
+    }
+}
+
+EXPORT int fe_act_probe(
+    void *p_act, void *p_local, void *p_univ,
+    const uint64_t *act_vals, int n_act,
+    uint64_t tgt, uint64_t vl, int K,
+    uint8_t *o_opab, uint64_t *oa, uint64_t *ob, uint64_t *ocomb,
+    uint64_t *od, uint64_t *oprod, uint64_t *ogap, int *osgn, int *osc
+) {
+    const ActPairSet *ap = (const ActPairSet *)p_act;
+    const BigDict *d = (const BigDict *)p_local;
+    const BigDict *u = (const BigDict *)p_univ;
+    if (!ap || !d || ap->n == 0U || tgt == 0ULL || K <= 0) return 0;
+    if (K > 32) K = 32;
+
+    ActHit hits_sc[16];  int ns = 0, ws = 0;
+    ActHit hits_gap[16]; int ng = 0, wg = 0;
+    int Ks = (K + 1) / 2; if (Ks > 16) Ks = 16; if (Ks < 1) Ks = 1;
+    int Kg = K - Ks; if (Kg > 16) Kg = 16;
+
+    const uint64_t *d_s24 = d->seen24;
+    const uint64_t *u_s24 = u ? u->seen24 : NULL;
+    uint32_t np = ap->n;
+    u128 t128 = (u128)tgt;
+    u128 vl128 = (u128)vl;
+
+    /* Probe 1: Direct E +- gap around tgt */
+    uint32_t lo = 0U, hi = np;
+    while (lo < hi) {
+        uint32_t mid = lo + ((hi - lo) >> 1);
+        if (ap->items[mid].v < tgt) lo = mid + 1U;
+        else hi = mid;
+    }
+    int64_t p_lo = (int64_t)lo - 16;
+    if (p_lo < 0) p_lo = 0;
+    int64_t p_hi = (int64_t)lo + 16;
+    if (p_hi > (int64_t)np) p_hi = (int64_t)np;
+    for (int64_t idx = p_lo; idx < p_hi; idx++) {
+        ActPair e = ap->items[idx];
+        uint64_t gap = (e.v <= tgt) ? (tgt - e.v) : (e.v - tgt);
+        uint8_t sgn = (e.v <= tgt) ? 1 : 0;
+        int32_t gcost;
+        if (gap == 0ULL) gcost = 0;
+        else if (act_vals && n_act > 0 && act_bsearch_has(act_vals, n_act, gap)) gcost = 1;
+        else gcost = anc_gap_cost(d, u, gap);
+        int32_t sc = 1 + (gap == 0ULL ? 0 : gcost);
+        act_push(hits_sc, &ns, &ws, Ks, 0, e.op, e.a, e.b, e.v, 1ULL, e.v, gap, sgn, sc);
+        if (Kg > 0 && gap < (1ULL << 28)) {
+            act_push(hits_gap, &ng, &wg, Kg, 1, e.op, e.a, e.b, e.v, 1ULL, e.v, gap, sgn, sc);
+        }
+    }
+
+    /* Probe 2: Quotient T ~ E * q +- gap where q in (D_local U U) */
+    uint64_t half_t = tgt >> 1;
+    for (uint32_t i = 0U; i < np; i++) {
+        ActPair e = ap->items[i];
+        uint64_t ev = e.v;
+        if (ev > half_t) break;
+        uint64_t q = tgt / ev;
+        uint64_t r = tgt % ev;
+        if (q >= 2ULL) {
+            int cq = -1;
+            if (q < (1ULL << 24)) {
+                if ((d_s24 && (d_s24[q >> 6] & (1ULL << (q & 63)))) ||
+                    (u_s24 && (u_s24[q >> 6] & (1ULL << (q & 63))))) {
+                    cq = lookup_cost_both(d, u, q);
+                }
+            } else if (q < (1ULL << 36)) {
+                int32_t id = bd_find(d, q);
+                if (id >= 0) cq = (int)meta_cost(d->meta[id]);
+            }
+            if (cq >= 0) {
+                int32_t gcost;
+                if (r == 0ULL) gcost = 0;
+                else if (act_vals && n_act > 0 && act_bsearch_has(act_vals, n_act, r)) gcost = 1;
+                else gcost = anc_gap_cost(d, u, r);
+                int32_t sc = 2 + cq + (r == 0ULL ? 0 : gcost);
+                act_push(hits_sc, &ns, &ws, Ks, 0, e.op, e.a, e.b, ev, q, ev * q, r, 1, sc);
+                if (Kg > 0 && r < (1ULL << 28)) {
+                    act_push(hits_gap, &ng, &wg, Kg, 1, e.op, e.a, e.b, ev, q, ev * q, r, 1, sc);
+                }
+            }
+        }
+        if (r > 0ULL && (u128)ev * (u128)(q + 1ULL) <= vl128) {
+            uint64_t q1 = q + 1ULL;
+            uint64_t r2 = ev - r;
+            int cq1 = -1;
+            if (q1 < (1ULL << 24)) {
+                if ((d_s24 && (d_s24[q1 >> 6] & (1ULL << (q1 & 63)))) ||
+                    (u_s24 && (u_s24[q1 >> 6] & (1ULL << (q1 & 63))))) {
+                    cq1 = lookup_cost_both(d, u, q1);
+                }
+            } else if (q1 < (1ULL << 36)) {
+                int32_t id = bd_find(d, q1);
+                if (id >= 0) cq1 = (int)meta_cost(d->meta[id]);
+            }
+            if (cq1 >= 0) {
+                int32_t gcost;
+                if (act_vals && n_act > 0 && act_bsearch_has(act_vals, n_act, r2)) gcost = 1;
+                else gcost = anc_gap_cost(d, u, r2);
+                int32_t sc = 2 + cq1 + gcost;
+                act_push(hits_sc, &ns, &ws, Ks, 0, e.op, e.a, e.b, ev, q1, ev * q1, r2, 0, sc);
+                if (Kg > 0 && r2 < (1ULL << 28)) {
+                    act_push(hits_gap, &ng, &wg, Kg, 1, e.op, e.a, e.b, ev, q1, ev * q1, r2, 0, sc);
+                }
+            }
+        }
+    }
+
+    /* Probe 3: Two-Pointer E * d_local +- gap over sorted ActPairSet x d->scan_vals */
+    if (d->scan_vals && d->n_scan > 0U && tgt > 100ULL) {
+        int nd = (int)d->n_scan;
+        uint64_t e0 = ap->items[0].v > 0ULL ? ap->items[0].v : 1ULL;
+        u128 max_d128 = ((t128 * 2ULL) / (u128)e0) + 4096ULL;
+        int d_lo = 0, d_hi = nd;
+        while (d_lo < d_hi) {
+            int mid = d_lo + ((d_hi - d_lo) >> 1);
+            if ((u128)d->scan_vals[mid] <= max_d128) d_lo = mid + 1;
+            else d_hi = mid;
+        }
+        int j = (d_lo > 0) ? (d_lo - 1) : 0;
+        int stride = (d_lo > 300000) ? (d_lo / 300000) : 1;
+        uint32_t i = 0U;
+        while (i < np && j >= 0) {
+            uint64_t dv = d->scan_vals[j];
+            if (dv <= 1ULL) break;
+            ActPair e = ap->items[i];
+            u128 prod = (u128)e.v * (u128)dv;
+            if (prod <= vl128) {
+                uint64_t g = (prod <= t128) ? (uint64_t)(t128 - prod) : (uint64_t)(prod - t128);
+                uint8_t sg = (prod <= t128) ? 1 : 0;
+                if (Kg > 0 && g < (1ULL << 28)) {
+                    int32_t g_est = (g == 0ULL) ? 0 : (bl64(g) / 3 + 4);
+                    int32_t sc_g = 2 + (int32_t)d->scan_costs[j] + g_est;
+                    act_push(hits_gap, &ng, &wg, Kg, 1, e.op, e.a, e.b, e.v, dv, (uint64_t)prod, g, sg, sc_g);
+                }
+                int32_t g_est = 0;
+                if (g > 0ULL) {
+                    if (g < (1ULL << 24)) {
+                        if ((d_s24 && (d_s24[g >> 6] & (1ULL << (g & 63)))) ||
+                            (u_s24 && (u_s24[g >> 6] & (1ULL << (g & 63))))) g_est = 4;
+                        else g_est = bl64(g) / 3 + 3;
+                    } else {
+                        g_est = bl64(g) / 3 + 4;
+                    }
+                }
+                int32_t sc = 2 + (int32_t)d->scan_costs[j] + g_est;
+                act_push(hits_sc, &ns, &ws, Ks, 0, e.op, e.a, e.b, e.v, dv, (uint64_t)prod, g, sg, sc);
+            }
+            if (prod < t128) i++;
+            else if (prod > t128) j -= stride;
+            else break;
+        }
+    }
+
+    ActHit combined[32];
+    int out = 0;
+    for (int h = 0; h < ns; h++) combined[out++] = hits_sc[h];
+    for (int h = 0; h < ng; h++) {
+        int dup = 0;
+        for (int k = 0; k < out; k++) {
+            if (combined[k].prod == hits_gap[h].prod && combined[k].comb == hits_gap[h].comb) {
+                dup = 1; break;
+            }
+        }
+        if (!dup && out < 32) combined[out++] = hits_gap[h];
+    }
+    for (int a_i = 1; a_i < out; a_i++) {
+        ActHit kv = combined[a_i];
+        int b_i = a_i - 1;
+        while (b_i >= 0 && (combined[b_i].sc > kv.sc ||
+               (combined[b_i].sc == kv.sc && combined[b_i].gap > kv.gap))) {
+            combined[b_i + 1] = combined[b_i];
+            b_i--;
+        }
+        combined[b_i + 1] = kv;
+    }
+    if (out > K) out = K;
+    for (int h = 0; h < out; h++) {
+        o_opab[h] = combined[h].opab;
+        oa[h] = combined[h].a;
+        ob[h] = combined[h].b;
+        ocomb[h] = combined[h].comb;
+        od[h] = combined[h].d;
+        oprod[h] = combined[h].prod;
+        ogap[h] = combined[h].gap;
+        osgn[h] = (int)combined[h].sgn;
+        osc[h] = (int)combined[h].sc;
+    }
+    return out;
+}
+
 EXPORT void fe_screen_smooth(
     uint64_t tgt, uint64_t vl, const int32_t *ks, int nk,
     const uint32_t *primes, int np, int32_t *out_sc
@@ -1973,6 +2329,26 @@ def get_clib() -> Optional[ctypes.CDLL]:
         ]
         lib.fe_find_active_1ops.restype = ctypes.c_int
 
+        lib.fe_act_pairs_create.argtypes = [
+            ctypes.POINTER(ctypes.c_uint64), ctypes.c_int, ctypes.c_uint64,
+        ]
+        lib.fe_act_pairs_create.restype = ctypes.c_void_p
+
+        lib.fe_act_pairs_free.argtypes = [ctypes.c_void_p]
+        lib.fe_act_pairs_free.restype = None
+
+        lib.fe_act_probe.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.c_int,
+            ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        lib.fe_act_probe.restype = ctypes.c_int
+
         lib.fe_screen_smooth.argtypes = [
             ctypes.c_uint64, ctypes.c_uint64,
             ctypes.POINTER(ctypes.c_int32), ctypes.c_int,
@@ -2261,6 +2637,19 @@ class DictEngine:
         self._oneop_op = (ctypes.c_uint8 * 64)()
         self._oneop_a = (ctypes.c_uint64 * 64)()
         self._oneop_b = (ctypes.c_uint64 * 64)()
+        self._act_ptr = None
+        self._act_key: Optional[tuple[tuple[int, ...], int]] = None
+        self._act_probe_cache: dict[tuple[int, bool, tuple[tuple[int, ...], int]], list[tuple[str, int, int, int, int, int, int, int, int]]] = {}
+        self._act_ap_buf = (ctypes.c_uint64 * 220)()
+        self._ap_op = (ctypes.c_uint8 * 32)()
+        self._ap_a = (ctypes.c_uint64 * 32)()
+        self._ap_b = (ctypes.c_uint64 * 32)()
+        self._ap_comb = (ctypes.c_uint64 * 32)()
+        self._ap_d = (ctypes.c_uint64 * 32)()
+        self._ap_prod = (ctypes.c_uint64 * 32)()
+        self._ap_gap = (ctypes.c_uint64 * 32)()
+        self._ap_sgn = (ctypes.c_int * 32)()
+        self._ap_sc = (ctypes.c_int * 32)()
         self.ctx = None
         self.univ_ctx = None
         self.c_scan_size = 0
@@ -2320,6 +2709,11 @@ class DictEngine:
         self.close()
 
     def close(self) -> None:
+        if self._act_ptr is not None and self.clib is not None:
+            self.clib.fe_act_pairs_free(self._act_ptr)
+            self._act_ptr = None
+            self._act_key = None
+        self._act_probe_cache.clear()
         if self.ctx is not None and self.clib is not None:
             self.clib.fe_dict_free(self.ctx)
             self.ctx = None
@@ -2626,6 +3020,94 @@ class DictEngine:
         )
         ranked = sorted(zip(out_arr, k_cands), key=lambda x: x[0])
         return [k for sc, k in ranked[:top_m] if sc < 9999]
+
+    def act_probe(
+        self, tgt: int, active_sorted: list[int], K: int = 12
+    ) -> list[tuple[str, int, int, int, int, int, int, int, int]]:
+        """
+        C99 Dynamic Active-Pair Virtual Dictionary Probe:
+        Builds sorted 1-op virtual hubs `E = a1 <op> a2` (+, -, *) over active nodes
+        and probes `E +- gap`, `E * q +- gap` (q in D_local U U), and two-pointer
+        `E * d_local +- gap`. Caches the compiled `ActPairSet` across identical active sets.
+        """
+        if len(active_sorted) < 2 or tgt <= 0 or tgt > self.vl:
+            return []
+        if len(active_sorted) <= 180:
+            act_sub = active_sorted
+        else:
+            small_pw = [a for a in active_sorted if a <= 262144 or a in self.powers][:80]
+            sp_set = set(small_pw)
+            tail_hi = [a for a in active_sorted if a not in sp_set][-(180 - len(small_pw)):]
+            act_sub = sorted(small_pw + tail_hi)
+        if len(act_sub) < 2:
+            return []
+
+        key = (tuple(act_sub), self.vl)
+        c_key = (tgt, self.univ_ctx is not None, key)
+        cached = self._act_probe_cache.get(c_key)
+        if cached is not None:
+            return cached[:K]
+
+        if self.clib is None or self.ctx is None:
+            return []
+
+        if self._act_key != key:
+            if self._act_ptr is not None:
+                self.clib.fe_act_pairs_free(self._act_ptr)
+                self._act_ptr = None
+            na = len(act_sub)
+            self._act_ap_buf[:na] = act_sub
+            self._act_ptr = self.clib.fe_act_pairs_create(
+                self._act_ap_buf, na, ctypes.c_uint64(self.vl)
+            )
+            self._act_key = key
+
+        if not self._act_ptr:
+            return []
+
+        act_full = active_sorted[-512:] if len(active_sorted) > 512 else active_sorted
+        nf = len(act_full)
+        self._act_buf[:nf] = act_full
+        Kq = min(32, max(K, 12))
+        nh = int(
+            self.clib.fe_act_probe(
+                self._act_ptr,
+                self.ctx,
+                self.univ_ctx,
+                self._act_buf,
+                nf,
+                ctypes.c_uint64(tgt),
+                ctypes.c_uint64(self.vl),
+                Kq,
+                self._ap_op,
+                self._ap_a,
+                self._ap_b,
+                self._ap_comb,
+                self._ap_d,
+                self._ap_prod,
+                self._ap_gap,
+                self._ap_sgn,
+                self._ap_sc,
+            )
+        )
+        res = [
+            (
+                _OP_MAP[int(self._ap_op[i])],
+                int(self._ap_a[i]),
+                int(self._ap_b[i]),
+                int(self._ap_comb[i]),
+                int(self._ap_d[i]),
+                int(self._ap_prod[i]),
+                int(self._ap_gap[i]),
+                int(self._ap_sgn[i]),
+                int(self._ap_sc[i]),
+            )
+            for i in range(nh)
+        ]
+        if len(self._act_probe_cache) >= 2048:
+            self._act_probe_cache.clear()
+        self._act_probe_cache[c_key] = res
+        return res[:K]
 
 
 def solve_value_beam(

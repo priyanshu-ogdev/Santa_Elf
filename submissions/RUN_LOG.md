@@ -146,3 +146,22 @@
   - **Bundle & AST Verification:** `submit.py` & `submissions/kaggle_submission_cell.py` (`306.1 KB`, `96` top-level symbols, `0` AST collisions, `py_compile` clean).
   - **`python -m pytest tests/ -v`:** **`38 passed in 381.11s`** (`0` failures, `0` skips).
   - **Standalone `submissions/kaggle_submission_cell.py` E2E `strat50.csv` (`50` stratified puzzles, `1,333` targets, `--cores 3 --ram-gb 4.0 --verify`):** **`10,625` total instructions** (**`-154` ops / `-1.43%`** vs Run 8.2 `10,779`, `7.97 ops/tgt`) in `168.1s`; `remat` spills fell **`196 (1.8%) -> 116 (1.1%) (-40.8%)`**, `dict_anc` fell **`4,288 -> 4,088`**, `Solver wins: {'dag_synthesizer': 45, 'solve_value_beam': 4, 'tiny_bfs': 1}`, `Warnings: 0`, **`Verification PASSED with 0 errors!`**.
+
+
+## Run 10 — C99 Dynamic Active-Pair Engine, Liveness SA & Shared-Hub Block-LNS (`head`)
+
+### Key Upgrades Since Run 9 (`262c924`)
+1. **Topological Min-Live Beam Scheduler (`src/dag_compiler.py`):** Added `_schedule_min_live_beam` (Kahn beam minimizing spills, peak live registers, and soft excess pressure) invoked in `compile_dag` only when greedy `_schedule_min_live` leaves spills. Verified `-1` op (`2146 -> 2145`) on `6`-puzzle ablation and `-3` (`2408 -> 2405`) vs Run 9 (`depth=1` NAF/1-op gap fallback was tested and rejected after regressive `+6` greedy drift ablation).
+2. **C99 Dynamic Active-Pair Virtual Dictionary Engine (`src/solvers/fast_engine.py`, `src/solvers/dag_synthesizer.py`):** Added `ActPairSet`, `fe_act_pairs_create` (LSD radix sort over 1-op `+`, `-`, `*` combinations of active DAG values `<= 180`), `fe_act_pairs_free`, `fe_act_probe` (Probe 1: `E +- gap`, Probe 2: `E * q +- gap` over `D_local U U` gated by L2 `seen24`, Probe 3: strided two-pointer `E * d_local +- gap`), cached on `DictEngine` (`act_probe`), and wired into `_synthesize_best_marginal` as `Engine 8b` (`depth >= 2`). Reduced the `10`-puzzle `D24M_10M` probe from `2405` to `2299`.
+3. **Multi-Start Fast Liveness SA, Shared-Internal-Hub Block-LNS & Alt-DAG Checkpoints (`src/dag_compiler.py`, `src/solvers/dag_synthesizer.py`):**
+   - Upgraded `compile_dag` with fast liveness SA pre-search (`_fast_pressure`, multi-start from `best_order` and `hub_cluster` with adaptive time budget `0.35s–1.35s`) plus `soft_remat=True` across `top_scheds[-4:]`.
+   - Updated Block-LNS in `solve()` to iterate over all shared internal DAG hub clusters `val_users.values()` (`2 <= len(cl) <= 5`) instead of only target nodes.
+   - Checkpointed `alt_init_defs`, `pre_pair_defs`, and `pre_block_defs` so heavy-spill DAGs (`len(best_prog) > len(cur_defs) + 6`) evaluate alternate smaller-spill DAGs instead of duplicating deterministic `compile_dag` calls on `cur_defs`.
+
+### Verified Results (`Run 10`)
+- **`D24M_10M` 10-Puzzle High-RAM Dict Probe (`U=8M, D_local=10M`):** **`2,268`** vs Run 9 `2,408` (**`-140` ops / `-5.81%`**, beats or ties Run 9 on 10/10 puzzles: `0075: 399->384`, `0612: 389->387`, `0899: 343->326`, `0106: 363->331`, `0941: 365->339`, `0442: 280->251`, `0966: 121->108`, `0066: 43->43`, `0828: 44->42`, `0121: 61->57`).
+- **Full `strat50.csv` E2E Standalone Verification (`submissions/kaggle_submission_cell.py --cores 3 --ram-gb 4.0 --verify`):**
+  - **`9,921` total ops (`7.44 ops/tgt`)** vs Run 9 `10,625` (**`-704` ops / `-6.63%`**), `W/L/T = 45/2/3`, elapsed `255.9s`, `Warnings: 0`, `Verification PASSED with 0 errors!`.
+  - Attribution (`1,333` targets): `dict_anc=3,277 (33.0%)`, `shared_hub=3,124 (31.5%)`, `glue=2,438 (24.6%)`, `target_leaf=1,038 (10.5%)`, `make_one=44 (0.4%)`, `remat=84 (0.8%)`.
+- **Unit Test Suite (`python -m pytest tests/ -v`):** **`38 passed in 405.94s`** (`0` failures, `0` skipped).
+- **Bundle Build (`python build_submit.py`):** `submit.py` and `submissions/kaggle_submission_cell.py` built (`337.1 KB`), `0` AST collisions.

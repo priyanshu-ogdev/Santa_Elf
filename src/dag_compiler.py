@@ -550,6 +550,129 @@ def _schedule_min_live(
     return sched
 
 
+def _schedule_min_live_beam(
+    needed: set[int],
+    defs: dict[int, tuple[str, int, int]],
+    height: dict[int, int],
+    ershov: dict[int, int],
+    seeds: set[int],
+    n_regs: int,
+    *,
+    beam_w: int = 16,
+    pressure_first: bool = False,
+) -> list[list[int]]:
+    """
+    Topological Kahn beam search minimizing register spills and peak/cumulative live
+    register pressure across the entire DAG without cloning state per transition.
+    """
+    nodes = sorted(needed, key=lambda v: (height.get(v, 0), v))
+    n = len(nodes)
+    if n == 0:
+        return []
+    idx_of = {v: i for i, v in enumerate(nodes)}
+
+    pa = [-1] * n
+    pb = [-1] * n
+    init_deps = [0] * n
+    init_out = [0] * n
+    children: list[list[int]] = [[] for _ in range(n)]
+    h_arr = [height.get(v, 0) for v in nodes]
+    e_arr = [ershov.get(v, 1) for v in nodes]
+
+    for i, v in enumerate(nodes):
+        _, a, b = defs[v]
+        d = 0
+        ia = idx_of.get(a, -1)
+        if ia >= 0:
+            pa[i] = ia
+            d += 1
+            children[ia].append(i)
+            init_out[ia] += 1
+        ib = idx_of.get(b, -1)
+        if ib >= 0 and ib != ia:
+            pb[i] = ib
+            d += 1
+            children[ib].append(i)
+            init_out[ib] += 1
+        init_deps[i] = d
+
+    ch_tup = [tuple(c) for c in children]
+    eff_cap = max(4, n_regs - len(seeds))
+    soft_cap = max(2, eff_cap - 4)
+    init_ready = [i for i in range(n) if init_deps[i] == 0]
+
+    # State: (spills, cum_excess, peak, live_cnt, mask, deps_rem, out_rem, ready_set, back_node)
+    # Linked list back_node = (prev_back_node_or_None, chosen_idx) avoids O(N^2) path copying.
+    beam: list[tuple[int, int, int, int, int, list[int], list[int], list[int], tuple | None]] = [
+        (0, 0, 0, 0, 0, init_deps, init_out, init_ready, None)
+    ]
+
+    for _step in range(n):
+        best_for_mask: dict[int, tuple[tuple[int, int, int, int, int, int, int], int, int, int, int, int, int]] = {}
+        for s_idx, (spills, cum_ex, peak, live_cnt, mask, deps_rem, out_rem, ready, _) in enumerate(beam):
+            for u in ready:
+                nmask = mask | (1 << u)
+                ia = pa[u]
+                ib = pb[u]
+                freed = (1 if ia >= 0 and out_rem[ia] == 1 else 0) + (
+                    1 if ib >= 0 and out_rem[ib] == 1 else 0
+                )
+                peak_step = live_cnt + (0 if freed > 0 else 1)
+                keeps = 1 if init_out[u] > 0 else 0
+                nlive = live_cnt + keeps - freed
+                nspills = spills + (peak_step - eff_cap if peak_step > eff_cap else 0)
+                npeak = peak if peak >= peak_step else peak_step
+                ncum = cum_ex + (nlive - soft_cap if nlive > soft_cap else 0) + (
+                    nlive if pressure_first else 0
+                )
+                if pressure_first:
+                    key = (nspills, nlive, npeak, ncum, init_out[u], e_arr[u], h_arr[u])
+                else:
+                    key = (nspills, npeak, ncum, nlive, init_out[u], e_arr[u], h_arr[u])
+                prev = best_for_mask.get(nmask)
+                if prev is None or key < prev[0]:
+                    best_for_mask[nmask] = (key, nspills, ncum, npeak, nlive, s_idx, u)
+
+        if not best_for_mask:
+            break
+        cands = list(best_for_mask.values())
+        if len(cands) > beam_w:
+            cands.sort(key=lambda x: x[0])
+            cands = cands[:beam_w]
+
+        next_beam: list[tuple[int, int, int, int, int, list[int], list[int], list[int], tuple | None]] = []
+        for _, nspills, ncum, npeak, nlive, s_idx, u in cands:
+            _, _, _, _, mask, deps_rem, out_rem, ready, back = beam[s_idx]
+            ndeps = list(deps_rem)
+            nout = list(out_rem)
+            nready = [r for r in ready if r != u]
+            ia = pa[u]
+            ib = pb[u]
+            if ia >= 0:
+                nout[ia] -= 1
+            if ib >= 0:
+                nout[ib] -= 1
+            for ch in ch_tup[u]:
+                nv = ndeps[ch] - 1
+                ndeps[ch] = nv
+                if nv == 0:
+                    nready.append(ch)
+            next_beam.append((nspills, ncum, npeak, nlive, mask | (1 << u), ndeps, nout, nready, (back, u)))
+        beam = next_beam
+
+    schedules: list[list[int]] = []
+    for state in beam:
+        path: list[int] = []
+        cur = state[8]
+        while cur is not None:
+            path.append(nodes[cur[1]])
+            cur = cur[0]
+        path.reverse()
+        if len(path) == n:
+            schedules.append(path)
+    return schedules
+
+
 def _emergency_compile(
     puzzle: Puzzle,
     defs: dict[int, tuple[str, int, int]],
@@ -702,6 +825,16 @@ def compile_dag(
 
     try_schedule(_schedule_min_live(needed, defs, height))
     if best_prog is None or len(best_prog) > optimal_len:
+        for pf in (False, True):
+            for b_sched in _schedule_min_live_beam(
+                needed, defs, height, ershov, seeds, puzzle.registers, beam_w=12, pressure_first=pf
+            )[:6]:
+                try_schedule(b_sched)
+                if best_prog is not None and len(best_prog) == optimal_len:
+                    break
+            if best_prog is not None and len(best_prog) == optimal_len:
+                break
+    if best_prog is None or len(best_prog) > optimal_len:
         for order in target_orders:
             for m_eval in (ershov, height):
                 try_order(order, flip_tie=False, metric=m_eval)
@@ -713,13 +846,118 @@ def compile_dag(
             if best_prog is not None and len(best_prog) == optimal_len:
                 break
 
-    # Permutation hill-climbing if any register spill remains
+    # Fast liveness Simulated Annealing pre-search + bounded exact-allocator hill-climbing
+    if best_prog is not None and len(best_prog) > optimal_len and len(targets) > 2 and n_trials > 0:
+        nodes_l = sorted(needed)
+        n_l = len(nodes_l)
+        idx_l = {v: i for i, v in enumerate(nodes_l)}
+        pa_l = [idx_l.get(defs[v][1], -1) for v in nodes_l]
+        pb_l = [idx_l.get(defs[v][2], -1) for v in nodes_l]
+        init_out_l = [0] * n_l
+        for i_l in range(n_l):
+            if pa_l[i_l] >= 0:
+                init_out_l[pa_l[i_l]] += 1
+            if pb_l[i_l] >= 0 and pb_l[i_l] != pa_l[i_l]:
+                init_out_l[pb_l[i_l]] += 1
+        n_regs = puzzle.registers
+        n_seeds_base = len(seeds)
+
+        def _fast_pressure(ord_t: list[int], metric_ev: dict[int, int]) -> tuple[int, int, int]:
+            sc = _schedule_dfs(ord_t, seeds, defs, metric_ev, lighter_first_on_tie=True)
+            lu = [-1] * n_l
+            sc_i = [idx_l[v] for v in sc]
+            for st_i, u_i in enumerate(sc_i):
+                a_i = pa_l[u_i]
+                b_i = pb_l[u_i]
+                if a_i >= 0:
+                    lu[a_i] = st_i
+                if b_i >= 0:
+                    lu[b_i] = st_i
+            cur = n_seeds_base
+            ov_sum = 0
+            ov_steps = 0
+            max_l = cur
+            for st_i, u_i in enumerate(sc_i):
+                a_i = pa_l[u_i]
+                b_i = pb_l[u_i]
+                dead = (1 if a_i >= 0 and lu[a_i] <= st_i else 0) + (
+                    1 if b_i >= 0 and b_i != a_i and lu[b_i] <= st_i else 0
+                )
+                peak_st = cur + (0 if dead > 0 else 1)
+                if peak_st > max_l:
+                    max_l = peak_st
+                if peak_st > n_regs:
+                    ov_steps += 1
+                    ov_sum += peak_st - n_regs
+                cur = cur + 1 - dead - (1 if init_out_l[u_i] == 0 else 0)
+            return (ov_sum, ov_steps, max_l)
+
+        rng = random.Random(42)
+        t_sa = time.monotonic()
+        init_spills = len(best_prog) - optimal_len
+        sa_budget = 1.35 if init_spills >= 14 else (0.85 if init_spills >= 5 else 0.35)
+        start_configs: list[tuple[list[int], dict[int, int], float]] = [
+            (list(best_order), best_metric, sa_budget * (0.65 if init_spills >= 8 and len(target_orders) > 1 else 1.0))
+        ]
+        if init_spills >= 8 and len(target_orders) > 1:
+            start_configs.append((list(target_orders[1]), ershov, sa_budget * 0.35))
+
+        sa_pool: list[tuple[list[int], dict[int, int]]] = []
+        seen_o: set[tuple[int, ...]] = set()
+        for start_ord, eval_m, cfg_bud in start_configs:
+            t_cfg = time.monotonic()
+            cur_order = list(start_ord)
+            cur_p = _fast_pressure(cur_order, eval_m)
+            best_p = cur_p
+            max_sa_steps = min(800, max(160, n_trials * 6))
+            for st_sa in range(max_sa_steps):
+                if (time.monotonic() - t_cfg) > cfg_bud or (time.monotonic() - t_sa) > sa_budget:
+                    break
+                cand_order = list(cur_order)
+                mv = st_sa & 3
+                if mv == 0:
+                    i = rng.randrange(len(cand_order) - 1)
+                    cand_order[i], cand_order[i + 1] = cand_order[i + 1], cand_order[i]
+                elif mv == 1:
+                    i, j = rng.sample(range(len(cand_order)), 2)
+                    cand_order[i], cand_order[j] = cand_order[j], cand_order[i]
+                elif mv == 2:
+                    i = rng.randrange(len(cand_order))
+                    j = rng.randrange(len(cand_order))
+                    val = cand_order.pop(i)
+                    cand_order.insert(j, val)
+                else:
+                    sz = min(3, max(2, len(cand_order) // 6))
+                    if len(cand_order) > sz + 1:
+                        i = rng.randrange(len(cand_order) - sz + 1)
+                        blk = cand_order[i : i + sz]
+                        del cand_order[i : i + sz]
+                        j = rng.randrange(len(cand_order) + 1)
+                        cand_order[j:j] = blk
+                p_sc = _fast_pressure(cand_order, eval_m)
+                if p_sc <= cur_p or (p_sc[0] - cur_p[0] <= 20 and rng.random() < 0.08):
+                    cur_order, cur_p = cand_order, p_sc
+                    if p_sc <= best_p:
+                        best_p = p_sc
+                        t_k = tuple(cand_order)
+                        if t_k not in seen_o:
+                            seen_o.add(t_k)
+                            sa_pool.append((list(cand_order), eval_m))
+
+        for sa_o, eval_m in sa_pool[-10:]:
+            try_order(sa_o, flip_tie=False, metric=eval_m)
+            if len(best_prog) == optimal_len:
+                break
+            try_order(sa_o, flip_tie=True, metric=eval_m)
+            if len(best_prog) == optimal_len:
+                break
+
     if best_prog is not None and len(best_prog) > optimal_len and len(targets) > 2 and n_trials > 0:
         rng = random.Random(42)
         t_start = time.monotonic()
         cur_order = list(best_order)
         for trial in range(n_trials):
-            if (time.monotonic() - t_start) > 1.10:
+            if (time.monotonic() - t_start) > 0.65:
                 break
             cand_order = list(cur_order)
             if trial % 4 == 0:
@@ -749,7 +987,7 @@ def compile_dag(
                     break
 
     if best_prog is not None and len(best_prog) > optimal_len:
-        for sc_try in reversed(top_scheds[-2:]):
+        for sc_try in reversed(top_scheds[-4:]):
             try:
                 p_sr = _allocate_schedule(puzzle, sc_try, defs, soft_remat=True)
                 if len(p_sr) < len(best_prog):
